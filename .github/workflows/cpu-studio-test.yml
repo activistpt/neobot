@@ -22,7 +22,7 @@ jobs:
       - name: Dependencias
         working-directory: dr
         run: |
-          pip install --quiet torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           pip install --quiet torchdiffeq==0.2.5 x-transformers==2.1.2 ema-pytorch==0.7.7 \
             prefigure==0.0.10 muq==0.1.0 mutagen librosa pykakasi jieba cn2an pypinyin \
             onnxruntime Unidecode phonemizer inflect py3langid "transformers==4.49.0" \
@@ -103,7 +103,7 @@ jobs:
 
       - name: Dependencias
         run: |
-          pip install --quiet torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
           pip install --quiet diffusers transformers accelerate safetensors imageio imageio-ffmpeg
 
       - name: Teste de geracao (video 4 steps)
@@ -117,7 +117,7 @@ jobs:
           step = 4
           repo = "ByteDance/AnimateDiff-Lightning"
           adapter = MotionAdapter().to("cpu", torch.float16)
-          adapter.load_state_dict(torch.load(hf_hub_download(repo, f"animatediff_lightning_{step}step_fp16.safetensors"), map_location="cpu"))
+          adapter.load_state_dict(torch.load(hf_hub_download(repo, f"animatediff_lightning_{step}step_diffusers.safetensors"), map_location="cpu"))
           pipe = AnimateDiffPipeline.from_pretrained("emilianJR/epiCRealism", motion_adapter=adapter, torch_dtype=torch.float16).to("cpu")
           pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing", beta_schedule="linear")
           print(f"[LOAD] {time.time()-t0:.0f}s", flush=True)
