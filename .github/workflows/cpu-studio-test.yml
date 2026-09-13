@@ -22,8 +22,7 @@ jobs:
           pip install --quiet torchdiffeq==0.2.5 x-transformers==2.1.2 ema-pytorch==0.7.7 \
             prefigure==0.0.10 muq==0.1.0 mutagen librosa pykakasi jieba cn2an pypinyin \
             onnxruntime Unidecode phonemizer inflect py3langid "transformers==4.49.0" \
-            accelerate einops safetensors huggingface_hub hydra-core omegaconf \
-            "LangSegment==0.3.5" tokenizers
+            accelerate einops safetensors huggingface_hub hydra-core omegaconf tokenizers
 
       - name: Baixar pacote diffrhythm do Space oficial
         run: |
@@ -53,7 +52,12 @@ jobs:
           [01:10.00]Ate amanha Lisboa
           EOF
           cat > difftest.py <<'EOF'
-          import os, sys, time
+          import os, sys, time, types
+          # Stub do LangSegment: para letras latinas (PT) o g2p nunca o chama — só o importa
+          _ls = types.ModuleType("LangSegment")
+          _ls.setfilters = lambda *a, **k: None
+          _ls.getTexts = lambda text: [{"text": text, "lang": "en"}]
+          sys.modules["LangSegment"] = _ls
           os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
           sys.path.insert(0, os.getcwd())
           import torch
