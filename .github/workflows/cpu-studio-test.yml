@@ -10,27 +10,33 @@ jobs:
     timeout-minutes: 50
     steps:
       - name: Sistema
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg espeak-ng
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg espeak-ng espeak-ng-data libespeak-ng1
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Clonar DiffRhythm
-        run: git clone --depth 1 https://github.com/ASLP-lab/DiffRhythm.git dr
-
-      - name: Dependencias
-        working-directory: dr
+      - name: Dependencias (pins do Space oficial)
         run: |
           pip install --quiet torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           pip install --quiet torchdiffeq==0.2.5 x-transformers==2.1.2 ema-pytorch==0.7.7 \
             prefigure==0.0.10 muq==0.1.0 mutagen librosa pykakasi jieba cn2an pypinyin \
             onnxruntime Unidecode phonemizer inflect py3langid "transformers==4.49.0" \
-            accelerate einops safetensors huggingface_hub
-          pip install --quiet --force-reinstall --no-deps py3langid
+            accelerate einops safetensors huggingface_hub hydra-core omegaconf \
+            "LangSegment==0.3.5" tokenizers
+
+      - name: Baixar pacote diffrhythm do Space oficial
+        run: |
+          cat > fetch_pkg.py <<'EOF'
+          from huggingface_hub import snapshot_download
+          snapshot_download("ASLP-lab/DiffRhythm", repo_type="space", local_dir=".",
+              allow_patterns=["diffrhythm/**", "src/negative_prompt.npy", "pretrained/*"])
+          print("pacote descarregado")
+          EOF
+          python fetch_pkg.py
+          ls diffrhythm/ diffrhythm/infer/ 2>/dev/null | head -20
 
       - name: Teste de geracao (musica cantada, 95s, 16 steps)
-        working-directory: dr
         run: |
           cat > test.lrc <<'EOF'
           [00:04.00]Neon acesos sobre o Tejo
@@ -49,19 +55,19 @@ jobs:
           cat > difftest.py <<'EOF'
           import os, sys, time
           os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-          sys.path.insert(0, ".")
-          sys.path.insert(0, "infer")
+          sys.path.insert(0, os.getcwd())
           import torch
-          import infer_utils
+          from diffrhythm.infer.infer_utils import (prepare_model, get_lrc_token,
+              get_style_prompt, get_negative_style_prompt, get_reference_latent, decode_audio)
           from einops import rearrange
           t0 = time.time()
-          cfm, tokenizer, muq, vae = infer_utils.prepare_model(2048, "cpu")
+          cfm, tokenizer, muq, vae, eval_model, eval_muq = prepare_model(2048, "cpu")
           print(f"[LOAD] {time.time()-t0:.0f}s", flush=True)
           lrc = open("test.lrc", encoding="utf-8").read()
-          lrc_prompt, start_time, end_frame, dur = infer_utils.get_lrc_token(2048, lrc, tokenizer, 95, "cpu")
-          style = infer_utils.get_style_prompt(muq, prompt="emotional pop piano")
-          neg = infer_utils.get_negative_style_prompt("cpu")
-          cond, pf = infer_utils.get_reference_latent("cpu", 2048, False, None, None, vae)
+          lrc_prompt, start_time, end_frame, dur = get_lrc_token(2048, lrc, tokenizer, 95, "cpu")
+          style = get_style_prompt(muq, prompt="emotional pop piano")
+          neg = get_negative_style_prompt("cpu")
+          cond, pf = get_reference_latent("cpu", 2048, False, None, None, vae)
           t1 = time.time()
           with torch.inference_mode():
               latents, _ = cfm.sample(cond=cond, text=lrc_prompt, duration=end_frame,
@@ -70,15 +76,15 @@ jobs:
                   start_time=start_time, latent_pred_segments=pf, batch_infer_num=1)
           gen_s = time.time() - t1
           print(f"[GEN] {gen_s:.0f}s", flush=True)
-          outs = []
+          audio = None
           for latent in latents:
               latent = latent.to(torch.float32).transpose(1, 2)
-              audio = infer_utils.decode_audio(latent, vae, chunked=False)
-              audio = rearrange(audio, "b d n -> d (b n)")
-              audio = audio.div(torch.max(torch.abs(audio))).clamp(-1, 1).mul(32767).to(torch.int16).cpu().numpy().T
-              outs.append(audio)
+              a = decode_audio(latent, vae, chunked=False)
+              a = rearrange(a, "b d n -> d (b n)")
+              audio = a.div(torch.max(torch.abs(a))).clamp(-1, 1).mul(32767).to(torch.int16).cpu().numpy().T
+              break
           import torchaudio
-          torchaudio.save("resultado.wav", torch.from_numpy(outs[0]), 44100)
+          torchaudio.save("resultado.wav", torch.from_numpy(audio), 44100)
           print(f"[TOTAL] {time.time()-t0:.0f}s resultado.wav={os.path.getsize('resultado.wav')}", flush=True)
           print("RESULTADO_DIFFRHYTHM=OK", flush=True)
           EOF
@@ -86,9 +92,7 @@ jobs:
 
       - name: Resumo
         if: always()
-        run: |
-          ls -la dr/resultado.wav 2>/dev/null || echo "sem ficheiro de audio"
-          grep -h "LOAD\|GEN\|TOTAL\|RESULTADO" nohup.out 2>/dev/null || true
+        run: ls -la resultado.wav 2>/dev/null || echo "sem ficheiro de audio"
 
   video-cpu:
     name: AnimateDiff-Lightning em CPU (video)
@@ -110,7 +114,8 @@ jobs:
       - name: Teste de geracao (video 4 steps)
         run: |
           cat > adtest.py <<'EOF'
-          import time, torch
+          import time, torch, os
+          from safetensors.torch import load_file
           from huggingface_hub import hf_hub_download
           from diffusers import AnimateDiffPipeline, MotionAdapter, EulerDiscreteScheduler
           from diffusers.utils import export_to_gif
@@ -118,7 +123,7 @@ jobs:
           step = 4
           repo = "ByteDance/AnimateDiff-Lightning"
           adapter = MotionAdapter().to("cpu", torch.float16)
-          adapter.load_state_dict(torch.load(hf_hub_download(repo, f"animatediff_lightning_{step}step_diffusers.safetensors"), map_location="cpu", weights_only=False))
+          adapter.load_state_dict(load_file(hf_hub_download(repo, f"animatediff_lightning_{step}step_diffusers.safetensors")))
           pipe = AnimateDiffPipeline.from_pretrained("emilianJR/epiCRealism", motion_adapter=adapter, torch_dtype=torch.float16).to("cpu")
           pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing", beta_schedule="linear")
           print(f"[LOAD] {time.time()-t0:.0f}s", flush=True)
@@ -129,7 +134,6 @@ jobs:
                      generator=torch.Generator("cpu").manual_seed(0))
           gen_s = time.time() - t1
           export_to_gif(out.frames[0], "adtest.gif")
-          import os
           print(f"[GEN] {gen_s:.0f}s [TOTAL] {time.time()-t0:.0f}s adtest.gif={os.path.getsize('adtest.gif')}", flush=True)
           print("RESULTADO_ANIMATEDIFF=OK", flush=True)
           EOF
