@@ -1,0 +1,43 @@
+name: Teste motor Seal
+
+# Diagnóstico isolado: verifica se o motor (yt-dlp nightly + aria2c + deno)
+# consegue extrair do YouTube a partir dos IPs da cloud do GitHub.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  teste:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar motor Seal
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg aria2 unzip
+          curl -fsSL --retry 3 -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+          sudo unzip -o /tmp/deno.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/deno
+          pip install "yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.tar.gz"
+          yt-dlp --version
+          deno --version | head -1
+
+      - name: Teste de extração YouTube
+        run: |
+          echo "=== TESTE 1: vídeo antigo (Me at the zoo)"
+          yt-dlp --no-playlist -f "bestaudio/best" --simulate --print "%(title)s" "https://www.youtube.com/watch?v=jNQXAC9IVRw" && echo "RESULTADO_TESTE1=OK" || echo "RESULTADO_TESTE1=FALHOU"
+
+      - name: Teste de extração YouTube 2
+        run: |
+          echo "=== TESTE 2: vídeo popular recente"
+          yt-dlp --no-playlist -f "bestaudio/best" --simulate --print "%(title)s" "https://www.youtube.com/watch?v=aqz-KE-bpKQ" && echo "RESULTADO_TESTE2=OK" || echo "RESULTADO_TESTE2=FALHOU"
+
+      - name: Teste TikTok via cobalt
+        run: |
+          R=$(curl -s --max-time 20 -X POST "https://co.otomir23.me/" -H "Accept: application/json" -H "Content-Type: application/json" -d '{"url":"https://www.tiktok.com/@scout2015/video/6718335390845095173","filenameStyle":"basic"}')
+          echo "$R"
+          echo "$R" | grep -q '"status":"tunnel"' && echo "RESULTADO_TESTE3=OK" || echo "RESULTADO_TESTE3=FALHOU"

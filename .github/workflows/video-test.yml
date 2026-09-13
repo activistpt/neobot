@@ -1,0 +1,43 @@
+name: Teste /video (LTX-Video)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ltx-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar gradio_client
+        run: pip install gradio_client
+      - name: Testar LTX-Video (texto→vídeo) a partir da cloud
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os, time
+          from gradio_client import Client
+          tok = os.environ.get("HF_TOKEN") or None
+          c = Client("Lightricks/ltx-video-distilled", token=tok, verbose=False)
+          t0 = time.time()
+          r = c.predict(
+              prompt="A cute red panda walking through a bamboo forest, cinematic, smooth motion",
+              negative_prompt="worst quality, blurry, jittery, distorted",
+              height_ui=512, width_ui=704,
+              mode="text-to-video",
+              duration_ui=3,
+              seed_ui=42, randomize_seed=True,
+              ui_guidance_scale=3.0,
+              improve_texture_flag=False,
+              api_name="/text_to_video",
+          )
+          dt = time.time() - t0
+          url = r["video"]["url"] if isinstance(r, dict) else r[0]["video"]["url"]
+          print(f"RESULTADO_TESTE: OK em {dt:.0f}s → {url}")
+          assert url.startswith("http"), "URL inválido"
+          print("RESULTADO_TESTE_FINAL: PASS")
+          EOF

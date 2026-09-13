@@ -1,0 +1,8 @@
+python-telegram-bot>=21.0
+httpx>=0.27
+# /music: cliente da API Gradio do Space ACE-Step (HF)
+gradio_client>=1.0
+# Motor Seal (JunkFood02/Seal): yt-dlp + aria2c + ffmpeg. O canal nightly do
+# yt-dlp é o que a app Seal usa — nunca fica bloqueado pelo YouTube.
+yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.tar.gz
+phonenumbers>=8.13

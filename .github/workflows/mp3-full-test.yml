@@ -1,0 +1,45 @@
+name: Teste /mp3 completo (função do bot)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mp3-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+      - name: Testar _y2mate_mp3_download ponta-a-ponta
+        run: |
+          python - <<'EOF'
+          import importlib.util, tempfile, time, json, re, urllib.request, traceback
+
+          spec = importlib.util.spec_from_file_location("bot", "bot.py")
+          bot = importlib.util.module_from_spec(spec)
+          try:
+              spec.loader.exec_module(bot)
+          except Exception:
+              traceback.print_exc()
+
+          t0 = time.time()
+          try:
+              r = bot._y2mate_mp3_download("https://www.youtube.com/watch?v=jNQXAC9IVRw", tempfile.mkdtemp())
+              dt = time.time() - t0
+              if r:
+                  path, title = r
+                  import os
+                  print(f"RESULTADO: OK em {dt:.0f}s | titulo={title!r} | tamanho={os.path.getsize(path)} bytes")
+                  with open(path, "rb") as fh:
+                      head = fh.read(4)
+                  print(f"HEADER: {head!r}")
+              else:
+                  print(f"RESULTADO: None após {dt:.0f}s — a função devolveu None")
+          except Exception as e:
+              print(f"RESULTADO: EXCECAO {type(e).__name__}: {e}")
+              traceback.print_exc()
+          EOF

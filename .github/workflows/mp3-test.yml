@@ -1,0 +1,93 @@
+name: Teste /mp3 (fontes YouTube-áudio)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mp3-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Testar fontes de áudio a partir da cloud
+        run: |
+          python - <<'EOF'
+          import time, json, re, urllib.request, urllib.error
+
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          VID = "jNQXAC9IVRw"  # "Me at the zoo" (19s)
+          YURL = f"https://www.youtube.com/watch?v={VID}"
+
+          def get_json(u, extra=None, data=None, method="GET"):
+              h = {"User-Agent": UA, "Accept": "application/json"}
+              if extra: h.update(extra)
+              req = urllib.request.Request(u, headers=h, data=data, method=method)
+              with urllib.request.urlopen(req, timeout=25) as r:
+                  return json.loads(r.read().decode("utf-8", errors="replace"))
+
+          # ---------- 1. y2mate.gs (atual) ----------
+          try:
+              headers = {"User-Agent": UA, "Referer": "https://y2mate.gs/", "Origin": "https://y2mate.gs", "Accept": "application/json"}
+              home = urllib.request.urlopen(urllib.request.Request("https://y2mate.gs/", headers={"User-Agent": UA}), timeout=20).read().decode("utf-8", errors="replace")
+              ak = (re.search(r"apiKey\s*=\s*['\"]([0-9a-f]{32})['\"]", home) or [None, "e4b503d6ae10c35b1d3ee822c807d2f5"])[1]
+              def gj(u, extra=None):
+                  h = dict(headers)
+                  if extra: h.update(extra)
+                  return json.loads(urllib.request.urlopen(urllib.request.Request(u, headers=h), timeout=25).read().decode("utf-8", errors="replace"))
+              auth = gj(f"https://eta.etacloud.org/api/v1/auth?api_key={ak}&_={int(time.time()*1000)}")
+              key = auth.get("key")
+              init = gj(f"https://eta.etacloud.org/api/v1/init?_={int(time.time()*1000)}", {"Authorization": f"Bearer {key}"}) if key else {}
+              cu = init.get("convertURL")
+              step = {}
+              if cu:
+                  u = cu
+                  for _ in range(3):
+                      step = gj(f"{u}&v={VID}&f=mp3&_={int(time.time()*1000)}")
+                      if step.get("redirect") == 1 and step.get("redirectURL"):
+                          u = step["redirectURL"]; continue
+                      break
+              durl = step.get("downloadURL") or ""
+              print(f"[y2mate] auth={'ok' if key else 'FALHOU'} convert={'ok' if durl else 'FALHOU'}")
+          except Exception as e:
+              print(f"[y2mate] EXCECAO: {type(e).__name__}: {e}")
+
+          # ---------- 2. loader.to / ab.cococococ.com ----------
+          try:
+              api = "dfcb6d76f2f6a9894gjkege8a4ab232222"
+              r = get_json(f"https://ab.cococococ.com/ajax/download.php?copyright=0&format=mp3&url={urllib.parse.quote(YURL)}&api={api}")
+              print(f"[loader.to] resposta: {json.dumps(r)[:200]}")
+          except Exception as e:
+              print(f"[loader.to] EXCECAO: {type(e).__name__}: {e}")
+
+          # ---------- 3. Invidious (latest_version → áudio direto) ----------
+          for inst in ("https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be", "https://invidious.f5.si"):
+              try:
+                  req = urllib.request.Request(f"{inst}/latest_version?id={VID}&itag=140", headers={"User-Agent": UA})
+                  resp = urllib.request.urlopen(req, timeout=25)
+                  clen = resp.headers.get("Content-Length", "?")
+                  ct = resp.headers.get("Content-Type", "?")
+                  print(f"[invidious {inst}] HTTP {resp.status} type={ct} len={clen}")
+                  resp.close()
+              except Exception as e:
+                  print(f"[invidious {inst}] EXCECAO: {type(e).__name__}: {e}")
+
+          # ---------- 4. Piped ----------
+          for api_b in ("https://pipedapi.adminforge.de", "https://api.piped.private.coffee", "https://pipedapi.drgns.space"):
+              try:
+                  streams = get_json(f"{api_b}/streams/{VID}")
+                  aud = [s for s in streams.get("audioStreams", []) if s.get("url")]
+                  print(f"[piped {api_b}] audioStreams={len(aud)} primeiro_url={'sim' if aud else 'nao'}")
+              except Exception as e:
+                  print(f"[piped {api_b}] EXCECAO: {type(e).__name__}: {e}")
+
+          # ---------- 5. cobalt para YouTube ----------
+          try:
+              body = json.dumps({"url": YURL, "downloadMode": "audio"}).encode()
+              r = get_json("https://co.otomir23.me/", data=body, extra={"Content-Type": "application/json"}, method="POST")
+              print(f"[cobalt-yt] resposta: {json.dumps(r)[:200]}")
+          except Exception as e:
+              print(f"[cobalt-yt] EXCECAO: {type(e).__name__}: {e}")
+          EOF

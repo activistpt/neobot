@@ -1,0 +1,12 @@
+# segredos e lixo local — nunca no repositório
+.env
+.neobot.lock
+neobot.log
+watchdog.log
+watchdog_output.log
+__pycache__/
+*.pyc
+fs_*.html
+sf_*
+rb.json
+y2m.js

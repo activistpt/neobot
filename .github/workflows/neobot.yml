@@ -1,0 +1,51 @@
+name: NEOBOT 24/7
+
+# Hospedagem gratuita 24/7 no GitHub Actions:
+# - O bot corre como job de longa duração (timeout máx. de 6h)
+# - A cada 5h25 o agendador dispara um novo job (o cancel-in-progress mata o
+#   anterior) → sessão do Telegram renovada ininterruptamente
+# - Repositório público = minutos de Actions ilimitados (grátis para sempre)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "25 */5 * * *"   # a cada 5h25 (desfasado para evitar picos :00)
+
+concurrency:
+  group: neobot
+  cancel-in-progress: true   # máx. 1 instância — nunca dois bots no mesmo token
+
+jobs:
+  neobot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg aria2 unzip
+          curl -fsSL --retry 3 -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+          sudo unzip -o /tmp/deno.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/deno
+          deno --version || true
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Teste do motor Seal (diagnostico)
+        continue-on-error: true
+        run: |
+          yt-dlp --version
+          yt-dlp --no-playlist -f "bestaudio/best" --simulate --print "%(title)s" "https://www.youtube.com/watch?v=jNQXAC9IVRw" || echo "TESTE_YOUTUBE_FALHOU"
+
+      - name: A arrancar o NEOBOT 🤖
+        env:
+          NEOBOT_TOKEN: ${{ secrets.NEOBOT_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}   # quota ZeroGPU do /music (ACE-Step)
+        run: python -X utf8 bot.py

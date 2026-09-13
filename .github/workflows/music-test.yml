@@ -1,0 +1,57 @@
+name: Teste /music (ACE-Step)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ace-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar gradio_client
+        run: pip install gradio_client
+      - name: Testar ACE-Step (geração de música) a partir da cloud
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os, time
+          from gradio_client import Client
+          tok = os.environ.get("HF_TOKEN").strip()
+          c = Client("ACE-Step/Ace-Step-v1.5", token=tok, verbose=False)
+          t0 = time.time()
+          r = c.predict(
+              selected_model="acestep-v15-turbo",
+              generation_mode="custom",
+              simple_query_input=None,
+              simple_vocal_language="unknown",
+              param_4="soft acoustic ballad, gentle guitar, warm vocals",
+              param_5="[verse]\nO Sol nasceu dourado\nsobre o Tejo a brilhar\n\n[chorus]\nLisboa, sou teu mar\nlevo-te no meu olhar",
+              param_6=0, param_7="", param_8="",
+              param_9="pt",
+              param_10=8,
+              param_11=7.0,
+              param_12=True,
+              param_13=-1, param_14=None,
+              param_15=-1,
+              param_16=1,
+              param_17=None, param_18=None,
+              param_19=0.0, param_20=-1,
+              param_23="text2music",
+              param_30="mp3",
+              param_32=False,
+              param_37=False, param_38=False, param_39=False,
+              param_47=None,
+              api_name="/generation_wrapper",
+          )
+          dt = time.time() - t0
+          sample1 = r[0]
+          url = getattr(sample1, "url", None) or getattr(sample1, "path", None)
+          print(f"RESULTADO_MUSIC: OK em {dt:.0f}s → {url}")
+          assert url and url.startswith("http"), "URL inválido"
+          print("RESULTADO_MUSIC_FINAL: PASS")
+          EOF
