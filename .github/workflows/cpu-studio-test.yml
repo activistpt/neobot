@@ -22,7 +22,8 @@ jobs:
           pip install --quiet torchdiffeq==0.2.5 x-transformers==2.1.2 ema-pytorch==0.7.7 \
             prefigure==0.0.10 muq==0.1.0 mutagen librosa pykakasi jieba cn2an pypinyin \
             onnxruntime Unidecode phonemizer inflect py3langid "transformers==4.49.0" \
-            accelerate einops safetensors huggingface_hub hydra-core omegaconf tokenizers
+            accelerate einops safetensors huggingface_hub hydra-core omegaconf tokenizers \
+            pyopenjtalk
 
       - name: Baixar pacote diffrhythm do Space oficial
         run: |
