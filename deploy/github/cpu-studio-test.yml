@@ -1,0 +1,139 @@
+name: Validacao motores CPU (DiffRhythm + AnimateDiff)
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  musica-cantada-cpu:
+    name: DiffRhythm em CPU (musica cantada)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Sistema
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg espeak-ng
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Clonar DiffRhythm
+        run: git clone --depth 1 https://github.com/ASLP-lab/DiffRhythm.git dr
+
+      - name: Dependencias
+        working-directory: dr
+        run: |
+          pip install --quiet torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet torchdiffeq==0.2.5 x-transformers==2.1.2 ema-pytorch==0.7.7 \
+            prefigure==0.0.10 muq==0.1.0 mutagen librosa pykakasi jieba cn2an pypinyin \
+            onnxruntime Unidecode phonemizer inflect py3langid "transformers==4.49.0" \
+            accelerate einops safetensors huggingface_hub
+
+      - name: Teste de geracao (musica cantada, 95s, 16 steps)
+        working-directory: dr
+        run: |
+          cat > test.lrc <<'EOF'
+          [00:04.00]Neon acesos sobre o Tejo
+          [00:10.00]A noite cai na cidade antiga
+          [00:16.00]Passos ecoam nas pedras do chiado
+          [00:22.00]O vento traz cheiro a mar
+          [00:28.00]Luzes trincam na agua escura
+          [00:34.00]Sonhos guardados num bolso roto
+          [00:40.00]A lua sobe devagar
+          [00:46.00]E a cidade canta comigo
+          [00:52.00]Neon acesos sobre o Tejo
+          [00:58.00]O amanhecer vem a caminho
+          [01:04.00]Ultima cancao da madrugada
+          [01:10.00]Ate amanha Lisboa
+          EOF
+          cat > difftest.py <<'EOF'
+          import os, sys, time
+          os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+          sys.path.insert(0, ".")
+          sys.path.insert(0, "infer")
+          import torch
+          import infer_utils
+          from einops import rearrange
+          t0 = time.time()
+          cfm, tokenizer, muq, vae = infer_utils.prepare_model(2048, "cpu")
+          print(f"[LOAD] {time.time()-t0:.0f}s", flush=True)
+          lrc = open("test.lrc", encoding="utf-8").read()
+          lrc_prompt, start_time, end_frame, dur = infer_utils.get_lrc_token(2048, lrc, tokenizer, 95, "cpu")
+          style = infer_utils.get_style_prompt(muq, prompt="emotional pop piano")
+          neg = infer_utils.get_negative_style_prompt("cpu")
+          cond, pf = infer_utils.get_reference_latent("cpu", 2048, False, None, None, vae)
+          t1 = time.time()
+          with torch.inference_mode():
+              latents, _ = cfm.sample(cond=cond, text=lrc_prompt, duration=end_frame,
+                  max_duration=end_frame, song_duration=dur, style_prompt=style,
+                  negative_style_prompt=neg, steps=16, cfg_strength=4.0,
+                  start_time=start_time, latent_pred_segments=pf, batch_infer_num=1)
+          gen_s = time.time() - t1
+          print(f"[GEN] {gen_s:.0f}s", flush=True)
+          outs = []
+          for latent in latents:
+              latent = latent.to(torch.float32).transpose(1, 2)
+              audio = infer_utils.decode_audio(latent, vae, chunked=False)
+              audio = rearrange(audio, "b d n -> d (b n)")
+              audio = audio.div(torch.max(torch.abs(audio))).clamp(-1, 1).mul(32767).to(torch.int16).cpu().numpy().T
+              outs.append(audio)
+          import torchaudio
+          torchaudio.save("resultado.wav", torch.from_numpy(outs[0]), 44100)
+          print(f"[TOTAL] {time.time()-t0:.0f}s resultado.wav={os.path.getsize('resultado.wav')}", flush=True)
+          print("RESULTADO_DIFFRHYTHM=OK", flush=True)
+          EOF
+          timeout 2400 python difftest.py || echo "RESULTADO_DIFFRHYTHM=FALHOU"
+
+      - name: Resumo
+        if: always()
+        run: |
+          ls -la dr/resultado.wav 2>/dev/null || echo "sem ficheiro de audio"
+          grep -h "LOAD\|GEN\|TOTAL\|RESULTADO" nohup.out 2>/dev/null || true
+
+  video-cpu:
+    name: AnimateDiff-Lightning em CPU (video)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Sistema
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dependencias
+        run: |
+          pip install --quiet torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet diffusers transformers accelerate safetensors imageio imageio-ffmpeg
+
+      - name: Teste de geracao (video 4 steps)
+        run: |
+          cat > adtest.py <<'EOF'
+          import time, torch
+          from huggingface_hub import hf_hub_download
+          from diffusers import AnimateDiffPipeline, MotionAdapter, EulerDiscreteScheduler
+          from diffusers.utils import export_to_gif
+          t0 = time.time()
+          step = 4
+          repo = "ByteDance/AnimateDiff-Lightning"
+          adapter = MotionAdapter().to("cpu", torch.float16)
+          adapter.load_state_dict(torch.load(hf_hub_download(repo, f"animatediff_lightning_{step}step_fp16.safetensors"), map_location="cpu"))
+          pipe = AnimateDiffPipeline.from_pretrained("emilianJR/epiCRealism", motion_adapter=adapter, torch_dtype=torch.float16).to("cpu")
+          pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing", beta_schedule="linear")
+          print(f"[LOAD] {time.time()-t0:.0f}s", flush=True)
+          t1 = time.time()
+          out = pipe(prompt="Cinematic waves crashing on rocks at the Portuguese coast, golden hour",
+                     negative_prompt="bad quality, worse quality", num_frames=16,
+                     guidance_scale=1.0, num_inference_steps=step,
+                     generator=torch.Generator("cpu").manual_seed(0))
+          gen_s = time.time() - t1
+          export_to_gif(out.frames[0], "adtest.gif")
+          import os
+          print(f"[GEN] {gen_s:.0f}s [TOTAL] {time.time()-t0:.0f}s adtest.gif={os.path.getsize('adtest.gif')}", flush=True)
+          print("RESULTADO_ANIMATEDIFF=OK", flush=True)
+          EOF
+          timeout 2400 python adtest.py || echo "RESULTADO_ANIMATEDIFF=FALHOU"
+
+      - name: Resumo
+        if: always()
+        run: ls -la adtest.gif 2>/dev/null || echo "sem ficheiro de video"
