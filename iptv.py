@@ -31,6 +31,12 @@ BASE = "https://playlistgen-rkdyiptv.pages.dev/api/rkdyiptv/playlist.m3u"
 # Token de referência (pessoal, expira a cada 7 dias).
 IPTV_TOKEN = "ae9561fa5f62af7c5a8e02df10221570e1abb886bf4d2709"
 
+# Terceira fonte: LISTAS PT (Xtream Codes; o 302 aponta para o servidor real).
+# Overridable via .env (NEOBOT_LISTASPT_URL) para rodar credenciais sem deploy.
+LISTAS_PT_URL = (
+    "http://peramancas.mine.nu:80/get.php?username=sacavem&password=pedro8062026&type=m3u_plus"
+)
+
 _TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iptv_token.txt")
 
 # O worker bloqueia browsers; players passam.
@@ -75,7 +81,17 @@ def _attr(attrs: str, nome: str) -> str:
 class Canal:
     """Um canal do M3U."""
 
-    __slots__ = ("nome", "grupo", "tvg_id", "tvg_name", "logo", "url", "url_direto", "web")
+    __slots__ = (
+        "nome",
+        "grupo",
+        "tvg_id",
+        "tvg_name",
+        "logo",
+        "url",
+        "url_direto",
+        "web",
+        "fonte",
+    )
 
     def __init__(
         self,
@@ -86,6 +102,7 @@ class Canal:
         logo: str,
         url: str,
         web: str | None = None,
+        fonte: str = "rkdy",
     ):
         self.nome = nome
         self.grupo = grupo
@@ -95,6 +112,7 @@ class Canal:
         self.url = url
         self.url_direto: str | None = None  # preenchido por resolver()
         self.web = web  # página web do canal (Rebel Pirate TV), se existir
+        self.fonte = fonte  # rkdy | rebel | listaspt
 
 
 class TokenExpirado(Exception):
@@ -118,6 +136,8 @@ class Playlist:
         # Segunda fonte local: lista do Rebel Pirate TV (gerada por gerar_rebel_m3u.py)
         self._ficheiro_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rebel.m3u")
         self._rebel: list[Canal] | None = None
+        # Terceira fonte: LISTAS PT (Xtream Codes)
+        self.listaspt_url = os.environ.get("NEOBOT_LISTASPT_URL", "").strip() or LISTAS_PT_URL
 
     # -- download + parse ----------------------------------------------------
 
@@ -135,10 +155,24 @@ class Playlist:
                 "Playlist vazia ou inválida — o token expirou/foi revogado. "
                 "Renova em @rkdyhelp1_bot e atualiza o .env (NEOBOT_IPTV_TOKEN) ou iptv_token.txt."
             )
-        logger.info("IPTV: %s canais descarregados", len(canais))
+        logger.info("IPTV: %s canais descarregados (RKDY)", len(canais))
         return canais
 
-    def _parse(self, texto: str) -> list[Canal]:
+    async def _fetch_listaspt(self) -> list[Canal]:
+        """Descarrega a LISTAS PT (Xtream Codes; segue o 302 para o servidor real)."""
+        async with httpx.AsyncClient(
+            timeout=120, headers={"User-Agent": UA_PLAYER}, follow_redirects=True
+        ) as client:
+            resp = await client.get(self.listaspt_url)
+            resp.raise_for_status()
+            texto = resp.text
+        canais = self._parse(texto, fonte="listaspt")
+        for c in canais:
+            c.grupo = f"LISTAS PT | {c.grupo}" if c.grupo else "LISTAS PT"
+        logger.info("IPTV: %s entradas descarregadas (LISTAS PT)", len(canais))
+        return canais
+
+    def _parse(self, texto: str, fonte: str = "rkdy") -> list[Canal]:
         canais: list[Canal] = []
         atual: dict | None = None
 
@@ -154,6 +188,7 @@ class Playlist:
                         logo=atual["logo"],
                         url=atual.get("url", ""),
                         web=atual.get("web"),
+                        fonte=fonte,
                     )
                 )
                 atual = None
@@ -188,29 +223,34 @@ class Playlist:
         if self._rebel is None:
             try:
                 with open(self._ficheiro_local, encoding="utf-8") as fh:
-                    self._rebel = self._parse(fh.read())
+                    self._rebel = self._parse(fh.read(), fonte="rebel")
                 logger.info("IPTV: %s canais locais (Rebel) carregados", len(self._rebel))
             except OSError:
                 self._rebel = []
         return self._rebel
 
     async def canais(self) -> list[Canal]:
-        """Canais RKDY + Rebel (local), com cache de 1 hora.
+        """Canais RKDY + LISTAS PT + Rebel (local), com cache de 1 hora.
 
-        Se a playlist remota falhar (token expirado, rede), os canais locais
-        do Rebel continuam disponíveis — o bot nunca fica sem lista.
+        Cada fonte é descarregada de forma independente: se uma falhar
+        (token expirado, rede), as outras continuam disponíveis.
         """
         async with self._lock:
             agora = time.monotonic()
             if self._canais is not None and (agora - self._fetched_at) < CACHE_TTL:
                 return self._canais
+            rkdy: list[Canal] = []
+            listas: list[Canal] = []
             try:
-                remotos = await self._fetch()
+                rkdy = await self._fetch()
             except Exception as e:
-                logger.warning("IPTV: remota falhou (%s); a usar só a lista local", e)
-                remotos = []
+                logger.warning("IPTV: RKDY falhou (%s)", e)
+            try:
+                listas = await self._fetch_listaspt()
+            except Exception as e:
+                logger.warning("IPTV: LISTAS PT falhou (%s)", e)
             locais = self._carregar_local()
-            self._canais = remotos + locais
+            self._canais = rkdy + listas + locais
             self._fetched_at = agora
             if not self._canais:
                 raise TokenExpirado(
@@ -239,12 +279,12 @@ class Playlist:
         return [c for c in await self.canais() if c.grupo == grupo][:limite]
 
     async def estado(self) -> dict:
-        """Diagnóstico: nº canais/categorias e expiração do token (codificada nos links)."""
+        """Diagnóstico: nº canais por fonte, categorias e expiração do token RKDY."""
         canais = await self.canais()
         expira_ms: int | None = None
-        n_rkdy = n_rebel = 0
+        n_rkdy = n_rebel = n_listas = 0
         for c in canais:
-            if "action=stream" in c.url:
+            if c.fonte == "rkdy":
                 n_rkdy += 1
                 if expira_ms is None:
                     m = _RE_D.search(c.url)
@@ -255,12 +295,15 @@ class Playlist:
                             expira_ms = int(info.get("e", 0)) or None
                         except Exception:
                             pass
+            elif c.fonte == "listaspt":
+                n_listas += 1
             else:
                 n_rebel += 1
         return {
             "canais": len(canais),
             "rkdy": n_rkdy,
             "rebel": n_rebel,
+            "listaspt": n_listas,
             "grupos": len(await self.grupos()),
             "token_expira_ms": expira_ms,
             "token_valido": bool(expira_ms and expira_ms > time.time() * 1000),

@@ -2871,11 +2871,12 @@ async def cmd_iptv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             grupos = sorted(await pl.grupos(), key=lambda x: -x[1])[:25]
         est = await pl.estado()
         texto = (
-            "📺 <b>NEOBOT IPTV</b> — RKDY + Rebel Pirate TV\n"
+            "📺 <b>NEOBOT IPTV</b> — RKDY + LISTAS PT + Rebel Pirate TV\n"
             f"Canais: <b>{est['canais']}</b> "
-            f"<i>(RKDY {est.get('rkdy', 0)} + Rebel {est.get('rebel', 0)})</i> · "
+            f"<i>(RKDY {est.get('rkdy', 0)} + LISTAS PT {est.get('listaspt', 0)} + "
+            f"Rebel {est.get('rebel', 0)})</i> · "
             f"Categorias: <b>{est['grupos']}</b>\n"
-            f"Token RKDY: {'✅ válido' if est['token_valido'] else '⚠️ expirado (canais Rebel continuam)'}"
+            f"Token RKDY: {'✅ válido' if est['token_valido'] else '⚠️ expirado (LISTAS PT e Rebel continuam)'}"
             f" (expira em {_iptv_expira_fmt(est['token_expira_ms'])})\n\n"
         )
         if not grupos:
@@ -2981,7 +2982,12 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for i, c in enumerate(res, 1):
             alvo = c.url_direto or c.url
             if alvo:
-                rotulo = "stream" if c.url_direto else "⚠️ stream (usar /canal)"
+                # RKDY precisa de resolução; Rebel e LISTAS PT são diretos
+                rotulo = (
+                    "stream"
+                    if c.url_direto or c.fonte in ("rebel", "listaspt")
+                    else "⚠️ stream (usar /canal)"
+                )
                 linhas.append(
                     f"{i}. {html.escape(c.nome)} → "
                     f"<a href=\"{html.escape(alvo, quote=True)}\">{rotulo}</a>"
