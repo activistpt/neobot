@@ -2958,7 +2958,7 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 linhas.append(f"{i}. {html.escape(c.nome)}")
         linhas.append(
-            "\nUsa <code>/canal &lt;n&gt;</code> para reler o stream (tokens RKDY renovam a cada pedido)."
+            "\nUsa <code>/canal &lt;n&gt;</code> para ver um resultado da lista."
         )
         await update.message.reply_text(
             "\n".join(linhas), parse_mode=ParseMode.HTML, disable_web_page_preview=True
