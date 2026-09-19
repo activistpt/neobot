@@ -14,6 +14,7 @@ Regras de conversão:
 
 import json
 import os
+import re
 import sys
 import urllib.parse
 
@@ -67,6 +68,19 @@ def carregar_canais(pasta_projeto: str) -> list[dict]:
 
 
 def construir_m3u(canais: list[dict]) -> str:
+    # Site hospedado em GitHub Pages com uma página de player por canal
+    site = "https://activistpt.github.io/pirate-tv-pages/c"
+    vistos: set[str] = set()
+
+    def _slug(ch: dict) -> str:
+        base = re.sub(r"[^a-z0-9_-]", "", str(ch.get("id", "")).lower()) or "canal"
+        slug, n = base, 2
+        while slug in vistos:
+            slug = f"{base}{n}"
+            n += 1
+        vistos.add(slug)
+        return slug
+
     linhas = ["#EXTM3U"]
     n_stream = n_web = 0
     for ch in canais:
@@ -77,20 +91,18 @@ def construir_m3u(canais: list[dict]) -> str:
         logo = (ch.get("image") or "").strip()
         cats = ch.get("categories") or []
         grupo = GRUPOS.get(cats[0], "Variedades") if cats else "Variedades"
+        pagina = f"{site}/{_slug(ch)}.html"
 
         jogavel = _decodificar(url)
+        attrs = f'tvg-id="{pagina}" tvg-name="{nome}"'
+        if logo:
+            attrs += f' tvg-logo="{logo}"'
         if jogavel and (".m3u8" in jogavel or ".mpd" in jogavel):
-            attrs = f'tvg-name="{nome}"'
-            if logo:
-                attrs += f' tvg-logo="{logo}"'
             linhas.append(f'#EXTINF:-1 {attrs} group-title="{grupo}",{nome}')
             linhas.append(_limpar(jogavel))
             n_stream += 1
         else:
             # Entrada web: mantém no M3U como meta, sem URL de stream
-            attrs = f'tvg-name="{nome}"'
-            if logo:
-                attrs += f' tvg-logo="{logo}"'
             linhas.append(f'#EXTINF:-1 {attrs} group-title="{grupo} · web",{nome}')
             linhas.append(f"#WEB {url}")
             n_web += 1

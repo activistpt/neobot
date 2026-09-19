@@ -175,14 +175,26 @@ class Playlist:
             if linha.startswith("#EXTINF"):
                 _flush()  # entrada anterior sem URL = canal só-web
                 attrs, _, display = linha.partition(",")
-                atual = {
-                    "nome": display.strip(),
-                    "grupo": _attr(attrs, "group-title"),
-                    "tvg_id": _attr(attrs, "tvg-id"),
-                    "tvg_name": _attr(attrs, "tvg-name"),
-                    "logo": _attr(attrs, "tvg-logo"),
-                    "web": None,
-                }
+                tvg_id = _attr(attrs, "tvg-id")
+                # tvg-id com URL = página web oficial do canal (site Pirate TV Pages)
+                if tvg_id.startswith("http"):
+                    atual = {
+                        "nome": display.strip(),
+                        "grupo": _attr(attrs, "group-title"),
+                        "tvg_id": "",
+                        "tvg_name": _attr(attrs, "tvg-name"),
+                        "logo": _attr(attrs, "tvg-logo"),
+                        "web": tvg_id,
+                    }
+                else:
+                    atual = {
+                        "nome": display.strip(),
+                        "grupo": _attr(attrs, "group-title"),
+                        "tvg_id": tvg_id,
+                        "tvg_name": _attr(attrs, "tvg-name"),
+                        "logo": _attr(attrs, "tvg-logo"),
+                        "web": None,
+                    }
             elif linha.startswith("#WEB ") and atual is not None:
                 atual["web"] = linha[5:].strip()
             elif not linha.startswith("#") and atual is not None:

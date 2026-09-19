@@ -2945,9 +2945,10 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         linhas = [f"🔎 <b>Resultados para “{html.escape(termo)}”</b>\n{nota}"]
         for i, c in enumerate(res, 1):
             if c.url:
+                pag = f' · <a href="{html.escape(c.web, quote=True)}">🌐 página</a>' if c.web else ""
                 linhas.append(
                     f"{i}. {html.escape(c.nome)} → "
-                    f"<a href=\"{html.escape(c.url, quote=True)}\">stream</a>"
+                    f"<a href=\"{html.escape(c.url, quote=True)}\">stream</a>{pag}"
                 )
             elif c.web:
                 linhas.append(
