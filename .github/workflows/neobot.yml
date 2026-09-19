@@ -7,6 +7,9 @@ name: NEOBOT 24/7
 # - Repositório público = minutos de Actions ilimitados (grátis para sempre)
 
 on:
+  push:
+    branches: [main]
+    paths: ["bot.py", "iptv.py"]
   workflow_dispatch:
   schedule:
     - cron: "25 */5 * * *"   # a cada 5h25 (desfasado para evitar picos :00)
@@ -47,5 +50,6 @@ jobs:
         env:
           NEOBOT_TOKEN: ${{ secrets.NEOBOT_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          NEOBOT_IPTV_TOKEN: ${{ secrets.NEOBOT_IPTV_TOKEN }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}   # quota ZeroGPU do /music (ACE-Step)
         run: python -X utf8 bot.py

@@ -219,6 +219,8 @@ def teclado_menu():
         "▪️ /radio — rádios portuguesas + rádio parceira HellGate 🌟\n"
         "▪️ /music — gera uma música original com a tua descrição 🎼 (ex: `/music balada sobre Coimbra`)\n"
         "▪️ /streamhub — sites de streaming: filmes, séries e IPTV 📺 (ex: `/streamhub filmes`)\n"
+        "▪️ /iptv — listas IPTV: estado e categorias 📡 (ex: `/iptv portuguese`)\n"
+        "▪️ /canal — procura canais IPTV 📺 (ex: `/canal sport tv`)\n"
         "▪️ /video — gera vídeo a partir de texto ou anima uma imagem 🎬 (ex: `/video um dragão a voar`)\n"
         "▪️ /avatar — avatar falante: responde a uma foto com `/avatar olá!` 🗣\n"
         "▪️ /ajuda — mostra esta mensagem\n\n"
@@ -2815,6 +2817,132 @@ async def cmd_streamhub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+# --- /iptv e /canal (playlist RKDY) ---
+
+try:  # corre como script (py bot.py) ou como módulo
+    from iptv import TokenExpirado, get_playlist
+except ImportError:  # pragma: no cover
+    from neobot.iptv import TokenExpirado, get_playlist
+
+_IPTV_LIMITE_LISTA = 15
+
+
+def _iptv_expira_fmt(ms: int | None) -> str:
+    """Expiração do token em formato humano (ex: '6d 23h')."""
+    if not ms:
+        return "?"
+    restante = ms / 1000 - time.time()
+    if restante <= 0:
+        return "expirado ⚠️"
+    return f"{int(restante // 86400)}d {int(restante % 86400 // 3600)}h"
+
+
+async def cmd_iptv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Estado da playlist + categorias (/iptv, /iptv <filtro>, /iptv validar <cat>)."""
+    pl = get_playlist()
+    args = " ".join(context.args).strip()
+    try:
+        if args.lower().startswith("validar"):
+            termo = args[len("validar"):].strip()
+            if not termo:
+                await update.message.reply_text(
+                    "Usa: `/iptv validar <categoria>` — ex: `/iptv validar portuguese`",
+                    parse_mode="Markdown",
+                )
+                return
+            msg = await update.message.reply_text(f"⏳ A validar canais de “{termo}”…")
+            grupos = await pl.grupos()
+            alvo = next((g for g, _ in grupos if termo.lower() in g.lower()), None)
+            if not alvo:
+                await msg.edit_text(f"Categoria não encontrada: {html.escape(termo)}")
+                return
+            res = await pl.validar_grupo(alvo, limite=20)
+            ok = sum(1 for _, vivo in res if vivo)
+            linhas = [f"📡 <b>{html.escape(alvo)}</b> — {ok}/{len(res)} ativos\n"]
+            for c, vivo in res:
+                linhas.append(f"{'✅' if vivo else '❌'} {html.escape(c.nome)}")
+            await msg.edit_text("\n".join(linhas), parse_mode=ParseMode.HTML)
+            return
+
+        if args:
+            filtro = args.lower()
+            grupos = [(g, n) for g, n in await pl.grupos() if filtro in g.lower()][:25]
+        else:
+            grupos = sorted(await pl.grupos(), key=lambda x: -x[1])[:25]
+        est = await pl.estado()
+        texto = (
+            "📺 <b>NEOBOT IPTV</b> — playlist RKDY\n"
+            f"Canais: <b>{est['canais']}</b> · Categorias: <b>{est['grupos']}</b>\n"
+            f"Token: {'✅ válido' if est['token_valido'] else '⚠️ expirado/por expirar'}"
+            f" (expira em {_iptv_expira_fmt(est['token_expira_ms'])})\n\n"
+        )
+        if not grupos:
+            texto += "Nenhuma categoria encontrada.\nUsa <code>/iptv</code> para ver as principais."
+        else:
+            for g, n in grupos:
+                texto += f"▸ {html.escape(g)} <i>({n})</i>\n"
+            texto += "\nCanais: <code>/canal &lt;categoria ou nome&gt;</code> (ex: <code>/canal sport tv</code>)"
+        await update.message.reply_text(
+            texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+    except TokenExpirado as e:
+        await update.message.reply_text(f"⚠️ {e}")
+
+
+async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Procura canais por nome/categoria; /canal <n> apanha um resultado anterior."""
+    pl = get_playlist()
+    termo = " ".join(context.args).strip()
+    if not termo:
+        await update.message.reply_text(
+            "Usa: `/canal <nome>` — ex: `/canal sport tv` — ou `/canal <n>` para apanhar "
+            "um resultado da última procura",
+            parse_mode="Markdown",
+        )
+        return
+
+    ultimos = context.chat_data.get("iptv_last") or []
+    if termo.isdigit() and ultimos:
+        i = int(termo) - 1
+        if 0 <= i < len(ultimos):
+            c = ultimos[i]
+            await update.message.reply_text(
+                f"📺 <b>{html.escape(c.nome)}</b>\nCategoria: {html.escape(c.grupo or '—')}\n\n"
+                f"<a href=\"{html.escape(c.url, quote=True)}\">▶️ Abrir stream</a> — colar no VLC/TiviMate\n"
+                f"<code>{html.escape(c.url, quote=True)}</code>",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        else:
+            await update.message.reply_text(f"Só há {len(ultimos)} resultados — usa 1 a {len(ultimos)}.")
+        return
+
+    try:
+        res = await pl.procurar(termo, limite=_IPTV_LIMITE_LISTA)
+        nota = ""
+        if not res:
+            grupos = [g for g, _ in await pl.grupos() if termo.lower() in g.lower()]
+            if grupos:
+                nota = f"Categoria: <b>{html.escape(grupos[0])}</b>\n\n"
+                res = await pl.do_grupo(grupos[0], limite=_IPTV_LIMITE_LISTA)
+        if not res:
+            await update.message.reply_text(f"Sem resultados para “{html.escape(termo)}”.")
+            return
+        context.chat_data["iptv_last"] = res
+        linhas = [f"🔎 <b>Resultados para “{html.escape(termo)}”</b>\n{nota}"]
+        for i, c in enumerate(res, 1):
+            linhas.append(
+                f"{i}. {html.escape(c.nome)} → "
+                f"<a href=\"{html.escape(c.url, quote=True)}\">stream</a>"
+            )
+        linhas.append("\nUsa <code>/canal &lt;n&gt;</code> para o link completo do resultado.")
+        await update.message.reply_text(
+            "\n".join(linhas), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+    except TokenExpirado as e:
+        await update.message.reply_text(f"⚠️ {e}")
+
+
 # --- /phone ---
 
 async def cmd_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2975,6 +3103,8 @@ def main() -> None:
     app.add_handler(CommandHandler("music", cmd_music))
     app.add_handler(CommandHandler("video", cmd_video))
     app.add_handler(CommandHandler("streamhub", cmd_streamhub))
+    app.add_handler(CommandHandler("iptv", cmd_iptv))
+    app.add_handler(CommandHandler("canal", cmd_canal))
 
     # Responde quando alguém escreve 'neobot' numa mensagem de grupo (sem slash)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, neobot_mention))
