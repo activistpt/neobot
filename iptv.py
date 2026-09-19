@@ -75,9 +75,18 @@ def _attr(attrs: str, nome: str) -> str:
 class Canal:
     """Um canal do M3U."""
 
-    __slots__ = ("nome", "grupo", "tvg_id", "tvg_name", "logo", "url", "url_direto")
+    __slots__ = ("nome", "grupo", "tvg_id", "tvg_name", "logo", "url", "url_direto", "web")
 
-    def __init__(self, nome: str, grupo: str, tvg_id: str, tvg_name: str, logo: str, url: str):
+    def __init__(
+        self,
+        nome: str,
+        grupo: str,
+        tvg_id: str,
+        tvg_name: str,
+        logo: str,
+        url: str,
+        web: str | None = None,
+    ):
         self.nome = nome
         self.grupo = grupo
         self.tvg_id = tvg_id
@@ -85,6 +94,7 @@ class Canal:
         self.logo = logo
         self.url = url
         self.url_direto: str | None = None  # preenchido por resolver()
+        self.web = web  # página web do canal (Rebel Pirate TV), se existir
 
 
 class TokenExpirado(Exception):
@@ -105,6 +115,9 @@ class Playlist:
         self._canais: list[Canal] | None = None
         self._fetched_at: float = 0.0
         self._lock = asyncio.Lock()
+        # Segunda fonte local: lista do Rebel Pirate TV (gerada por gerar_rebel_m3u.py)
+        self._ficheiro_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rebel.m3u")
+        self._rebel: list[Canal] | None = None
 
     # -- download + parse ----------------------------------------------------
 
@@ -128,11 +141,29 @@ class Playlist:
     def _parse(self, texto: str) -> list[Canal]:
         canais: list[Canal] = []
         atual: dict | None = None
+
+        def _flush() -> None:
+            nonlocal atual
+            if atual is not None:
+                canais.append(
+                    Canal(
+                        nome=atual["nome"],
+                        grupo=atual["grupo"],
+                        tvg_id=atual["tvg_id"],
+                        tvg_name=atual["tvg_name"],
+                        logo=atual["logo"],
+                        url=atual.get("url", ""),
+                        web=atual.get("web"),
+                    )
+                )
+                atual = None
+
         for raw in texto.splitlines():
             linha = raw.strip()
             if not linha:
                 continue
             if linha.startswith("#EXTINF"):
+                _flush()  # entrada anterior sem URL = canal só-web (Rebel)
                 attrs, _, display = linha.partition(",")
                 atual = {
                     "nome": display.strip(),
@@ -140,22 +171,52 @@ class Playlist:
                     "tvg_id": _attr(attrs, "tvg-id"),
                     "tvg_name": _attr(attrs, "tvg-name"),
                     "logo": _attr(attrs, "tvg-logo"),
+                    "web": None,
                 }
+            elif linha.startswith("#WEB ") and atual is not None:
+                atual["web"] = linha[5:].strip()
             elif not linha.startswith("#") and atual is not None:
-                canais.append(Canal(url=linha, **atual))
-                atual = None
+                atual["url"] = linha
+                _flush()
+        _flush()
         return canais
 
     # -- API pública ----------------------------------------------------------
 
+    def _carregar_local(self) -> list[Canal]:
+        """Canais do rebel.m3u (lista do Rebel Pirate TV), carregados uma vez."""
+        if self._rebel is None:
+            try:
+                with open(self._ficheiro_local, encoding="utf-8") as fh:
+                    self._rebel = self._parse(fh.read())
+                logger.info("IPTV: %s canais locais (Rebel) carregados", len(self._rebel))
+            except OSError:
+                self._rebel = []
+        return self._rebel
+
     async def canais(self) -> list[Canal]:
-        """Lista completa de canais, com cache de 1 hora."""
+        """Canais RKDY + Rebel (local), com cache de 1 hora.
+
+        Se a playlist remota falhar (token expirado, rede), os canais locais
+        do Rebel continuam disponíveis — o bot nunca fica sem lista.
+        """
         async with self._lock:
             agora = time.monotonic()
             if self._canais is not None and (agora - self._fetched_at) < CACHE_TTL:
                 return self._canais
-            self._canais = await self._fetch()
+            try:
+                remotos = await self._fetch()
+            except Exception as e:
+                logger.warning("IPTV: remota falhou (%s); a usar só a lista local", e)
+                remotos = []
+            locais = self._carregar_local()
+            self._canais = remotos + locais
             self._fetched_at = agora
+            if not self._canais:
+                raise TokenExpirado(
+                    "Playlist vazia ou inválida — o token expirou/foi revogado. "
+                    "Renova em @rkdyhelp1_bot e atualiza o .env (NEOBOT_IPTV_TOKEN) ou iptv_token.txt."
+                )
             return self._canais
 
     async def grupos(self) -> list[tuple[str, int]]:
@@ -181,17 +242,25 @@ class Playlist:
         """Diagnóstico: nº canais/categorias e expiração do token (codificada nos links)."""
         canais = await self.canais()
         expira_ms: int | None = None
-        if canais:
-            m = _RE_D.search(canais[0].url)
-            if m:
-                try:
-                    b64 = m.group(1) + "=" * (-len(m.group(1)) % 4)
-                    info = json.loads(base64.urlsafe_b64decode(b64))
-                    expira_ms = int(info.get("e", 0)) or None
-                except Exception:
-                    pass
+        n_rkdy = n_rebel = 0
+        for c in canais:
+            if "action=stream" in c.url:
+                n_rkdy += 1
+                if expira_ms is None:
+                    m = _RE_D.search(c.url)
+                    if m:
+                        try:
+                            b64 = m.group(1) + "=" * (-len(m.group(1)) % 4)
+                            info = json.loads(base64.urlsafe_b64decode(b64))
+                            expira_ms = int(info.get("e", 0)) or None
+                        except Exception:
+                            pass
+            else:
+                n_rebel += 1
         return {
             "canais": len(canais),
+            "rkdy": n_rkdy,
+            "rebel": n_rebel,
             "grupos": len(await self.grupos()),
             "token_expira_ms": expira_ms,
             "token_valido": bool(expira_ms and expira_ms > time.time() * 1000),
@@ -228,8 +297,8 @@ class Playlist:
             return None
 
     async def validar_grupo(self, grupo: str, limite: int = 30) -> list[tuple[Canal, bool]]:
-        """Valida até `limite` canais de uma categoria em paralelo."""
-        canais = await self.do_grupo(grupo, limite=limite)
+        """Valida até `limite` streams de uma categoria em paralelo (só canais com stream)."""
+        canais = [c for c in await self.do_grupo(grupo, limite=limite * 2) if c.url][:limite]
         sem = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
         async def _um(c: Canal) -> tuple[Canal, bool]:

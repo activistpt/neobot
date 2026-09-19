@@ -2871,9 +2871,11 @@ async def cmd_iptv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             grupos = sorted(await pl.grupos(), key=lambda x: -x[1])[:25]
         est = await pl.estado()
         texto = (
-            "📺 <b>NEOBOT IPTV</b> — playlist RKDY\n"
-            f"Canais: <b>{est['canais']}</b> · Categorias: <b>{est['grupos']}</b>\n"
-            f"Token: {'✅ válido' if est['token_valido'] else '⚠️ expirado/por expirar'}"
+            "📺 <b>NEOBOT IPTV</b> — RKDY + Rebel Pirate TV\n"
+            f"Canais: <b>{est['canais']}</b> "
+            f"<i>(RKDY {est.get('rkdy', 0)} + Rebel {est.get('rebel', 0)})</i> · "
+            f"Categorias: <b>{est['grupos']}</b>\n"
+            f"Token RKDY: {'✅ válido' if est['token_valido'] else '⚠️ expirado (canais Rebel continuam)'}"
             f" (expira em {_iptv_expira_fmt(est['token_expira_ms'])})\n\n"
         )
         if not grupos:
@@ -2912,6 +2914,25 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         i = int(termo) - 1
         if 0 <= i < len(ultimos):
             c = ultimos[i]
+            if not c.url and c.web:
+                await update.message.reply_text(
+                    f"🌐 <b>{html.escape(c.nome)}</b>\nCategoria: {html.escape(c.grupo or '—')}\n\n"
+                    f"Este canal não tem stream direto — abre como página:\n"
+                    f"<a href=\"{html.escape(c.web, quote=True)}\">{html.escape(c.web)}</a>",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                return
+            if "action=stream" not in c.url:
+                # Stream direto (lista Rebel: .m3u8/.mpd) — funciona como está
+                await update.message.reply_text(
+                    f"📺 <b>{html.escape(c.nome)}</b>\nCategoria: {html.escape(c.grupo or '—')}\n\n"
+                    f"▶️ <a href=\"{html.escape(c.url, quote=True)}\">Abrir stream direto</a>\n"
+                    f"<code>{html.escape(c.url, quote=True)}</code>",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                return
             await update.message.reply_text("⏳ A resolver o stream…")
             direto = await pl.resolver(c.url)
             c.url_direto = direto
@@ -2922,6 +2943,13 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"<code>{html.escape(direto, quote=True)}</code>\n\n"
                     "⚠️ O token dura pouco — se abrir mal, pede novo com <code>/canal "
                     f"{i + 1}</code>.",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            elif c.web:
+                await update.message.reply_text(
+                    f"⚠️ Stream indisponível, mas há página web do canal:\n"
+                    f"<a href=\"{html.escape(c.web, quote=True)}\">{html.escape(c.web)}</a>",
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
@@ -2948,10 +2976,18 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.chat_data["iptv_last"] = res
         linhas = [f"🔎 <b>Resultados para “{html.escape(termo)}”</b>\n{nota}"]
         for i, c in enumerate(res, 1):
-            linhas.append(
-                f"{i}. {html.escape(c.nome)} → "
-                f"<a href=\"{html.escape(c.url, quote=True)}\">stream</a>"
-            )
+            if c.url:
+                linhas.append(
+                    f"{i}. {html.escape(c.nome)} → "
+                    f"<a href=\"{html.escape(c.url, quote=True)}\">stream</a>"
+                )
+            elif c.web:
+                linhas.append(
+                    f"{i}. {html.escape(c.nome)} → "
+                    f"<a href=\"{html.escape(c.web, quote=True)}\">🌐 página web</a>"
+                )
+            else:
+                linhas.append(f"{i}. {html.escape(c.nome)}")
         linhas.append("\nUsa <code>/canal &lt;n&gt;</code> para abrir o stream direto do resultado.")
         await update.message.reply_text(
             "\n".join(linhas), parse_mode=ParseMode.HTML, disable_web_page_preview=True
