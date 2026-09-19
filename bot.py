@@ -29,7 +29,7 @@ try:  # optional dependency for /phone
     from phonenumbers import timezone as _pn_timezone
 except ImportError:
     phonenumbers = None
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -2887,6 +2887,12 @@ async def cmd_iptv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except TokenExpirado as e:
         await update.message.reply_text(f"⚠️ {e}")
+    except Exception as e:
+        logger.error("Erro no /iptv", exc_info=True)
+        await update.message.reply_text(
+            f"⚠️ Erro inesperado no /iptv: {html.escape(str(e)) or 'desconhecido'}\n"
+            "Tenta outra vez dentro de minutos."
+        )
 
 
 async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2952,6 +2958,12 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except TokenExpirado as e:
         await update.message.reply_text(f"⚠️ {e}")
+    except Exception as e:
+        logger.error("Erro no /canal", exc_info=True)
+        await update.message.reply_text(
+            f"⚠️ Erro inesperado no /canal: {html.escape(str(e)) or 'desconhecido'}\n"
+            "Tenta outra vez dentro de minutos."
+        )
 
 
 # --- /phone ---
@@ -3058,7 +3070,30 @@ def _public_url() -> str:
 
 
 async def _post_init(app: Application) -> None:
-    """Lança o keepalive self-ping quando o bot fica operacional."""
+    """Regista o menu de comandos no Telegram e lança o keepalive."""
+    try:
+        await app.bot.set_my_commands(
+            [
+                BotCommand("start", "Menu principal"),
+                BotCommand("ajuda", "Lista de comandos"),
+                BotCommand("iptv", "IPTV: estado e categorias 📡"),
+                BotCommand("canal", "Procurar canais IPTV 📺"),
+                BotCommand("ask", "Perguntar à IA"),
+                BotCommand("google", "Pesquisar na internet"),
+                BotCommand("news", "Notícias"),
+                BotCommand("wiki", "Wikipédia"),
+                BotCommand("meteo", "Meteorologia"),
+                BotCommand("cinema", "Filmes em cartaz"),
+                BotCommand("torrent", "Procurar torrents"),
+                BotCommand("download", "Descarregar vídeo de um link"),
+                BotCommand("mp3", "Extrair áudio de um link"),
+                BotCommand("radio", "Rádios portuguesas"),
+                BotCommand("streamhub", "Sites de streaming"),
+                BotCommand("hora", "Que horas são"),
+            ]
+        )
+    except Exception:
+        logger.warning("Não consegui registar o menu de comandos", exc_info=True)
     app.create_task(_keepalive_loop(app))
 
 
