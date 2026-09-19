@@ -219,7 +219,7 @@ def teclado_menu():
         "▪️ /radio — rádios portuguesas + rádio parceira HellGate 🌟\n"
         "▪️ /music — gera uma música original com a tua descrição 🎼 (ex: `/music balada sobre Coimbra`)\n"
         "▪️ /streamhub — sites de streaming: filmes, séries e IPTV 📺 (ex: `/streamhub filmes`)\n"
-        "▪️ /iptv — listas IPTV: estado e categorias 📡 (ex: `/iptv portuguese`)\n"
+        "▪️ /iptv — IPTV mundial por página web: categorias 📡 (ex: `/iptv web`)\n"
         "▪️ /canal — procura canais IPTV 📺 (ex: `/canal sport tv`)\n"
         "▪️ /video — gera vídeo a partir de texto ou anima uma imagem 🎬 (ex: `/video um dragão a voar`)\n"
         "▪️ /avatar — avatar falante: responde a uma foto com `/avatar olá!` 🗣\n"
@@ -2817,24 +2817,14 @@ async def cmd_streamhub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
-# --- /iptv e /canal (playlist RKDY) ---
+# --- /iptv e /canal (fontes por página web: Rebel + SportOnline + TV Garden) ---
 
 try:  # corre como script (py bot.py) ou como módulo
-    from iptv import TokenExpirado, get_playlist
+    from iptv import PlaylistVazia, get_playlist
 except ImportError:  # pragma: no cover
-    from neobot.iptv import TokenExpirado, get_playlist
+    from neobot.iptv import PlaylistVazia, get_playlist
 
 _IPTV_LIMITE_LISTA = 15
-
-
-def _iptv_expira_fmt(ms: int | None) -> str:
-    """Expiração do token em formato humano (ex: '6d 23h')."""
-    if not ms:
-        return "?"
-    restante = ms / 1000 - time.time()
-    if restante <= 0:
-        return "expirado ⚠️"
-    return f"{int(restante // 86400)}d {int(restante % 86400 // 3600)}h"
 
 
 async def cmd_iptv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2871,13 +2861,12 @@ async def cmd_iptv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             grupos = sorted(await pl.grupos(), key=lambda x: -x[1])[:25]
         est = await pl.estado()
         texto = (
-            "📺 <b>NEOBOT IPTV</b> — RKDY + LISTAS PT + Rebel Pirate TV\n"
+            "📺 <b>NEOBOT IPTV</b> — por página web (mundial)\n"
             f"Canais: <b>{est['canais']}</b> "
-            f"<i>(RKDY {est.get('rkdy', 0)} + LISTAS PT {est.get('listaspt', 0)} + "
-            f"Rebel {est.get('rebel', 0)})</i> · "
+            f"<i>(Rebel: {est['canais'] - est.get('szo', 0) - est.get('garden', 0)} · "
+            f"SportOnline: {est.get('szo', 0)} · TV Garden: {est.get('garden', 0)})</i> · "
             f"Categorias: <b>{est['grupos']}</b>\n"
-            f"Token RKDY: {'✅ válido' if est['token_valido'] else '⚠️ expirado (LISTAS PT e Rebel continuam)'}"
-            f" (expira em {_iptv_expira_fmt(est['token_expira_ms'])})\n\n"
+            f"Streams diretos: <b>{est['streams']}</b> · Páginas web: <b>{est['web']}</b>\n\n"
         )
         if not grupos:
             texto += "Nenhuma categoria encontrada.\nUsa <code>/iptv</code> para ver as principais."
@@ -2888,7 +2877,7 @@ async def cmd_iptv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
-    except TokenExpirado as e:
+    except PlaylistVazia as e:
         await update.message.reply_text(f"⚠️ {e}")
     except Exception as e:
         logger.error("Erro no /iptv", exc_info=True)
@@ -2915,7 +2904,7 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         i = int(termo) - 1
         if 0 <= i < len(ultimos):
             c = ultimos[i]
-            if not c.url and c.web:
+            if c.web:
                 await update.message.reply_text(
                     f"🌐 <b>{html.escape(c.nome)}</b>\nCategoria: {html.escape(c.grupo or '—')}\n\n"
                     f"Este canal não tem stream direto — abre como página:\n"
@@ -2924,7 +2913,7 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     disable_web_page_preview=True,
                 )
                 return
-            if "action=stream" not in c.url:
+            if c.url:
                 # Stream direto (lista Rebel: .m3u8/.mpd) — funciona como está
                 await update.message.reply_text(
                     f"📺 <b>{html.escape(c.nome)}</b>\nCategoria: {html.escape(c.grupo or '—')}\n\n"
@@ -2933,31 +2922,9 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
-                return
-            # Reutiliza a resolução feita na lista, se existir; senão resolve agora
-            direto = c.url_direto or await pl.resolver(c.url)
-            c.url_direto = direto
-            if direto:
-                await update.message.reply_text(
-                    f"📺 <b>{html.escape(c.nome)}</b>\nCategoria: {html.escape(c.grupo or '—')}\n\n"
-                    f"▶️ <a href=\"{html.escape(direto, quote=True)}\">Abrir stream direto</a> (fonte original)\n"
-                    f"<code>{html.escape(direto, quote=True)}</code>\n\n"
-                    "⚠️ O token dura pouco — se abrir mal, pede novo com <code>/canal "
-                    f"{i + 1}</code>.",
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            elif c.web:
-                await update.message.reply_text(
-                    f"⚠️ Stream indisponível, mas há página web do canal:\n"
-                    f"<a href=\"{html.escape(c.web, quote=True)}\">{html.escape(c.web)}</a>",
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
             else:
                 await update.message.reply_text(
-                    "❌ Não consegui resolver o stream (canal offline ou link expirado). "
-                    "Tenta outro resultado.",
+                    "❌ Entrada sem stream nem página web — tenta outro resultado.",
                 )
         else:
             await update.message.reply_text(f"Só há {len(ultimos)} resultados — usa 1 a {len(ultimos)}.")
@@ -2975,22 +2942,12 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"Sem resultados para “{html.escape(termo)}”.")
             return
         context.chat_data["iptv_last"] = res
-        # Pré-resolver os links RKDY: o link action=stream bloqueia browsers
-        # (Access Denied), mas o destino do redirect 302 abre em qualquer lado.
-        await pl.resolver_lote(res)
         linhas = [f"🔎 <b>Resultados para “{html.escape(termo)}”</b>\n{nota}"]
         for i, c in enumerate(res, 1):
-            alvo = c.url_direto or c.url
-            if alvo:
-                # RKDY precisa de resolução; Rebel e LISTAS PT são diretos
-                rotulo = (
-                    "stream"
-                    if c.url_direto or c.fonte in ("rebel", "listaspt")
-                    else "⚠️ stream (usar /canal)"
-                )
+            if c.url:
                 linhas.append(
                     f"{i}. {html.escape(c.nome)} → "
-                    f"<a href=\"{html.escape(alvo, quote=True)}\">{rotulo}</a>"
+                    f"<a href=\"{html.escape(c.url, quote=True)}\">stream</a>"
                 )
             elif c.web:
                 linhas.append(
@@ -3005,7 +2962,7 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "\n".join(linhas), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
-    except TokenExpirado as e:
+    except PlaylistVazia as e:
         await update.message.reply_text(f"⚠️ {e}")
     except Exception as e:
         logger.error("Erro no /canal", exc_info=True)

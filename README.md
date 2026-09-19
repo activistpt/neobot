@@ -1,35 +1,42 @@
 # 🤖 NEOBOT
 
-Assistente multiusos para Telegram — hospedado 24/7 gratuitamente no GitHub Actions.
+Assistente multiusos para Telegram.
 
 ## Comandos
 
-`/ajuda` mostra a lista completa: /ask (IA Groq) · /google · /news · /wiki · /image · /audio ·
-/meteo · /youtube · /crypto · /cinema · /estreias · /imdb · /play · /ipinfo · /ipscan ·
-/iplookup · /phone · /torrent · /download · /mp3 · /radio · /piada · e mais.
+| Comando | Descrição |
+|---------|-----------|
+| `/start` | Mensagem de boas-vindas + menu |
+| `/ajuda` | Mostra a lista de comandos |
+| `/hora` | Que horas são |
+| `/data` | Que dia é hoje |
+| `/piada` | Uma piada aleatória |
+| `/dado` | Lança um dado (1-6) |
+| `/moeda` | Cara ou coroa |
+| `/escolhe` | Escolhe por ti — ex: `/escolhe pizza sushi burger` |
+| `/ask` | Pergunta algo à IA — ex: `/ask quem escreveu Dom Casmurro?` ou responde a uma msg com `/ask` |
+| `/iptv` | IPTV mundial por página web: Rebel (756) + SportOnline (25) + TV Garden (20 países) |
+| `/canal` | Procura canais e devolve streams ou páginas web — ex: `/canal sport tv`; `/canal 2` apanha o 2.º resultado |
 
-Extras IPTV:
-- `/iptv` — estado da playlist RKDY + categorias (ex: `/iptv portuguese`); validar: `/iptv validar desporto`
-- `/canal <nome>` — procura canais e devolve links de stream (ex: `/canal sport tv`); `/canal <n>` apanha um resultado
-
-## Token IPTV
-
-O token da playlist RKDY expira a cada 7 dias (renovar em @rkdyhelp1_bot).
-Para atualizar sem novo deploy: Settings → Secrets and variables → Actions →
-New repository secret → `NEOBOT_IPTV_TOKEN`.
-
-## Como corre 24/7
-
-- **GitHub Actions** mantém o bot online: o workflow `neobot.yml` corre o bot como job
-  de longa duração (6h) e o cron renova a sessão a cada 5h25 — sem interrupções.
-- Repositório público = minutos de Actions ilimitados no plano grátis.
-- `concurrency` garante **1 única instância** (nunca dois bots no mesmo token).
-- O token do bot e a chave da Groq vivem em **GitHub Secrets** (nunca no código).
-
-## Local (opcional)
+## Setup
 
 ```bash
+# 1. Criar o bot no Telegram
+#    Fala com @BotFather -> /newbot -> nome: NEOBOT
+#    Copia o token que ele te dá
+
+# 2. Criar ambiente virtual e instalar dependências
+py -m venv .venv
+.venv\Scripts\activate        # Windows
 pip install -r requirements.txt
-# .env com NEOBOT_TOKEN e GROQ_API_KEY
-python bot.py
+
+# 3. Configurar o token e a chave Groq
+copy .env.example .env
+#    Edita o .env: cola o teu token do BotFather e a tua GROQ_API_KEY
+#    (obtém a chave grátis em https://console.groq.com/keys)
+
+# 4. Arrancar
+py bot.py
 ```
+
+O bot fica a correr no terminal. Para parar, `Ctrl+C`.
