@@ -75,7 +75,7 @@ def _attr(attrs: str, nome: str) -> str:
 class Canal:
     """Um canal do M3U."""
 
-    __slots__ = ("nome", "grupo", "tvg_id", "tvg_name", "logo", "url")
+    __slots__ = ("nome", "grupo", "tvg_id", "tvg_name", "logo", "url", "url_direto")
 
     def __init__(self, nome: str, grupo: str, tvg_id: str, tvg_name: str, logo: str, url: str):
         self.nome = nome
@@ -84,6 +84,7 @@ class Canal:
         self.tvg_name = tvg_name
         self.logo = logo
         self.url = url
+        self.url_direto: str | None = None  # preenchido por resolver()
 
 
 class TokenExpirado(Exception):
@@ -206,6 +207,25 @@ class Playlist:
                 return resp.status_code in (200, 206)
         except Exception:
             return False
+
+    async def resolver(self, url: str) -> str | None:
+        """Resolve um link action=stream para o URL direto da fonte original.
+
+        O worker responde 302 para o stream real; esse destino final não tem a
+        restrição "só funciona em apps IPTV" — abre em qualquer player/browser.
+        O token do redirect é por-pedido, por isso resolver fresco a cada uso.
+        """
+        if not url or "action=stream" not in url:
+            return None
+        try:
+            async with httpx.AsyncClient(
+                timeout=STREAM_TIMEOUT, headers={"User-Agent": UA_PLAYER}, follow_redirects=False
+            ) as client:
+                resp = await client.get(url)
+                loc = resp.headers.get("location", "").strip()
+                return loc or None
+        except Exception:
+            return None
 
     async def validar_grupo(self, grupo: str, limite: int = 30) -> list[tuple[Canal, bool]]:
         """Valida até `limite` canais de uma categoria em paralelo."""

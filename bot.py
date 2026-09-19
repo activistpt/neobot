@@ -2906,13 +2906,24 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         i = int(termo) - 1
         if 0 <= i < len(ultimos):
             c = ultimos[i]
-            await update.message.reply_text(
-                f"📺 <b>{html.escape(c.nome)}</b>\nCategoria: {html.escape(c.grupo or '—')}\n\n"
-                f"<a href=\"{html.escape(c.url, quote=True)}\">▶️ Abrir stream</a> — colar no VLC/TiviMate\n"
-                f"<code>{html.escape(c.url, quote=True)}</code>",
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            await update.message.reply_text("⏳ A resolver o stream…")
+            direto = await pl.resolver(c.url)
+            c.url_direto = direto
+            if direto:
+                await update.message.reply_text(
+                    f"📺 <b>{html.escape(c.nome)}</b>\nCategoria: {html.escape(c.grupo or '—')}\n\n"
+                    f"▶️ <a href=\"{html.escape(direto, quote=True)}\">Abrir stream direto</a> (fonte original)\n"
+                    f"<code>{html.escape(direto, quote=True)}</code>\n\n"
+                    "⚠️ O token dura pouco — se abrir mal, pede novo com <code>/canal "
+                    f"{i + 1}</code>.",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Não consegui resolver o stream (canal offline ou link expirado). "
+                    "Tenta outro resultado.",
+                )
         else:
             await update.message.reply_text(f"Só há {len(ultimos)} resultados — usa 1 a {len(ultimos)}.")
         return
@@ -2935,7 +2946,7 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"{i}. {html.escape(c.nome)} → "
                 f"<a href=\"{html.escape(c.url, quote=True)}\">stream</a>"
             )
-        linhas.append("\nUsa <code>/canal &lt;n&gt;</code> para o link completo do resultado.")
+        linhas.append("\nUsa <code>/canal &lt;n&gt;</code> para abrir o stream direto do resultado.")
         await update.message.reply_text(
             "\n".join(linhas), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
