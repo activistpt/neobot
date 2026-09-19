@@ -205,6 +205,7 @@ def teclado_menu():
         "▪️ /meteo — meteorologia (ex: `/meteo Lisboa`)\n"
         "▪️ /youtube — pesquisa no YouTube (ex: `/youtube tutorial python`)\n"
         "▪️ /crypto — preços de crypto (ex: `/crypto btc`)\n"
+        "▪️ /webcams — webcams ao vivo por categoria (ex: `/webcams beach`)\n"
         "▪️ /cinema — filmes em cartaz\n"
         "▪️ /estreias — estreias da semana\n"
         "▪️ /imdb — info de filmes (ex: `/imdb Matrix`)\n"
@@ -1004,7 +1005,81 @@ async def cmd_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await thinking.edit_text(texto)
 
 
-# --- /cinema e /estreias ---
+# --- /webcams (webcamtaxi.com) ---
+
+_WEBCAMS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webcams.json")
+
+
+def _carregar_webcams() -> dict:
+    """Carrega webcams.json (cache simples em memória)."""
+    global _WEBCAMS_CACHE
+    try:
+        return _WEBCAMS_CACHE
+    except NameError:
+        pass
+    dados = {}
+    try:
+        with open(_WEBCAMS_JSON, encoding="utf-8") as fh:
+            dados = json.load(fh)
+    except Exception:
+        logger.exception("Falha ao carregar webcams.json")
+    _WEBCAMS_CACHE = dados
+    return dados
+
+
+async def cmd_webcams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    dados = _carregar_webcams()
+    if not dados:
+        await update.message.reply_text("❌ Lista de webcams indisponível. Tenta mais tarde.")
+        return
+    args = " ".join(context.args).strip().lower()
+    total = sum(len(i.get("webcams", [])) for i in dados.values())
+    if not args:
+        linhas = [f"📷 <b>Webcams ao vivo — webcamtaxi.com</b> ({total} em {len(dados)} categorias)", ""]
+        for slug, info in dados.items():
+            n = len(info.get("webcams", []))
+            linhas.append(f"▪️ /webcams {slug} — {info['nome']} ({n})")
+        linhas.append("")
+        linhas.append("Usa /webcams <categoria> ou /webcams <cidade/local> para pesquisar.")
+        texto = "\n".join(linhas)
+        try:
+            await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except Exception:
+            await update.message.reply_text(texto)
+        return
+    # categoria exata (slug) ou pesquisa de texto em todas as categorias
+    resultados: list[tuple[str, dict]] = []
+    slug_direto = args.replace(" ", "-")
+    if slug_direto in dados:
+        fonte = f"📁 <b>{html.escape(dados[slug_direto]['nome'])}</b> — 12 de {len(dados[slug_direto]['webcams'])}"
+        for w in dados[slug_direto]["webcams"][:12]:
+            resultados.append((dados[slug_direto]["nome"], w))
+    else:
+        termos = args.split()
+        vistos: set[str] = set()
+        for info in dados.values():
+            for w in info.get("webcams", []):
+                alvo = f"{w['titulo']} {w.get('cidade', '')} {w.get('pais', '')}".lower()
+                if all(t in alvo for t in termos) and w["url"] not in vistos:
+                    vistos.add(w["url"])
+                    resultados.append((info["nome"], w))
+        fonte = f"🔎 Pesquisa “{html.escape(args)}” — {len(resultados)} resultados"
+    if not resultados:
+        await update.message.reply_text(
+            f"🤔 Nada encontrado para “{args}”. Usa /webcams para ver as categorias."
+        )
+        return
+    linhas = [fonte, ""]
+    for _cat, w in resultados[:12]:
+        linhas.append(f"▪️ {html.escape(w['titulo'])}")
+        linhas.append(f"   {w['url']}")
+    linhas.append("")
+    linhas.append("▶️ Clica no link — o preview do Telegram reproduz o live (YouTube).")
+    texto = "\n".join(linhas)
+    try:
+        await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        await update.message.reply_text(texto)
 
 async def _list_web_results(query: str, limit: int) -> list[tuple[str, str, str]]:
     try:
@@ -3137,6 +3212,7 @@ async def _post_init(app: Application) -> None:
                 BotCommand("ajuda", "Lista de comandos"),
                 BotCommand("iptv", "IPTV: estado e categorias 📡"),
                 BotCommand("canal", "Procurar canais IPTV 📺"),
+                BotCommand("webcams", "Webcams ao vivo 📷"),
                 BotCommand("ask", "Perguntar à IA"),
                 BotCommand("google", "Pesquisar na internet"),
                 BotCommand("news", "Notícias"),
@@ -3210,6 +3286,7 @@ def main() -> None:
     app.add_handler(CommandHandler("streamhub", cmd_streamhub))
     app.add_handler(CommandHandler("iptv", cmd_iptv))
     app.add_handler(CommandHandler("canal", cmd_canal))
+    app.add_handler(CommandHandler("webcams", cmd_webcams))
 
     # Responde quando alguém escreve 'neobot' numa mensagem de grupo (sem slash)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, neobot_mention))
