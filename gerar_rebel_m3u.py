@@ -68,8 +68,8 @@ def carregar_canais(pasta_projeto: str) -> list[dict]:
 
 
 def construir_m3u(canais: list[dict]) -> str:
-    # Site hospedado em GitHub Pages com uma página de player por canal
-    site = "https://activistpt.github.io/canais-tv/c"
+    # Site hospedado em Hugging Face Space estatico (URL fora do github.io)
+    site = "https://ptlegion-canais-tv.static.hf.space/c"
     vistos: set[str] = set()
 
     def _slug(ch: dict) -> str:
