@@ -886,17 +886,67 @@ _CRYPTO_IDS = {
     "ltc": "litecoin", "litecoin": "litecoin",
     "trx": "tron", "tron": "tron",
     "avax": "avalanche-2", "avalanche": "avalanche-2",
+    "xmr": "monero", "monero": "monero",
+    "zec": "zcash", "zcash": "zcash",
+    "dash": "dash", "dcr": "decred", "decred": "decred",
+    "bch": "bitcoin-cash", "bitcoin cash": "bitcoin-cash",
+    "etc": "ethereum-classic", "ethereum classic": "ethereum-classic",
+    "atom": "cosmos", "cosmos": "cosmos",
+    "near": "near", "apt": "aptos", "aptos": "aptos",
+    "arb": "arbitrum", "arbitrum": "arbitrum",
+    "op": "optimism", "optimism": "optimism",
+    "matic": "matic-network", "polygon": "matic-network",
+    "mkr": "maker", "maker": "maker",
+    "aave": "aave", "uni": "uniswap", "uniswap": "uniswap",
+    "shib": "shiba-inu", "shiba": "shiba-inu",
+    "pepe": "pepe", "bonk": "bonk",
+    "ton": "the-open-network", "toncoin": "the-open-network",
+    "icp": "internet-computer",
+    "fil": "filecoin", "filecoin": "filecoin",
+    "alg": "algorand", "algorand": "algorand",
+    "hbar": "hedera-hashgraph", "hedera": "hedera-hashgraph",
+    "xlm": "stellar", "stellar": "stellar",
+    "vet": "vechain", "vechain": "vechain",
+    "sand": "the-sandbox", "mana": "decentraland",
     "usdt": "tether", "tether": "tether",
     "usdc": "usd-coin",
 }
 
 
-def _fmt_price(price: float) -> str:
+def _fmt_price(price: float, moeda: str = "usd") -> str:
+    simbolo = "€" if moeda == "eur" else "$"
     if price >= 1000:
-        return f"${price:,.0f}"
+        return f"{simbolo}{price:,.0f}"
     if price >= 1:
-        return f"${price:,.2f}"
-    return f"${price:.6f}"
+        return f"{simbolo}{price:,.2f}"
+    return f"{simbolo}{price:.6f}"
+
+
+async def _resolver_coin_id(termo: str) -> tuple[str, str] | None:
+    """Resolve qualquer ticker/nome para (id, nome) na CoinGecko (pesquisa na API)."""
+    try:
+        data = (
+            await _http_get(
+                "https://api.coingecko.com/api/v3/search?query="
+                + urllib.parse.quote(termo)
+            )
+        ).json()
+        moedas = data.get("coins") or []
+        escolhida = None
+        for moeda in moedas:
+            simbolo = (moeda.get("symbol") or "").lower()
+            nome = (moeda.get("name") or "").lower()
+            if simbolo == termo or nome == termo:
+                escolhida = moeda
+                break
+        if escolhida is None and moedas:
+            escolhida = moedas[0]
+        if escolhida and escolhida.get("id"):
+            return (escolhida["id"], escolhida.get("name") or termo)
+        return None
+    except Exception:
+        logger.exception("Falha na pesquisa da CoinGecko")
+        return None
 
 
 async def cmd_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -904,13 +954,15 @@ async def cmd_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     thinking = await update.message.reply_text("🪙 A consultar os preços...")
     try:
         if moeda:
-            coin_id = _CRYPTO_IDS.get(moeda)
-            if not coin_id:
+            _hit = _CRYPTO_IDS.get(moeda)
+            _res = (_hit, moeda.upper()) if _hit else await _resolver_coin_id(moeda)
+            if not _res:
                 await thinking.edit_text(
-                    f"🤔 Não conheço “{html.escape(moeda)}”. Tenta: btc, eth, sol, ada, doge, xrp, bnb, dot, link, ltc, trx, avax.",
+                    f"🤔 Não encontrei “{html.escape(moeda)}”. Tenta: btc, eth, sol, ada, doge, xrp, bnb, xmr, ltc, trx, dot, link — ou o nome de qualquer moeda.",
                     parse_mode=ParseMode.HTML,
                 )
                 return
+            coin_id, nome_exib = _res
             data = (
                 await _http_get(
                     f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd,eur&include_24hr_change=true"
@@ -923,9 +975,9 @@ async def cmd_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             change = entry.get("usd_24h_change")
             tendencia = f" ({'📈 +' if (change or 0) >= 0 else '📉 '}{change:.1f}% 24h)" if change is not None else ""
             texto = (
-                f"🪙 *{html.escape(moeda.upper())}*\n"
+                f"🪙 <b>{html.escape(nome_exib)}</b>\n"
                 f"USD: {_fmt_price(entry.get('usd', 0))}{tendencia}\n"
-                f"EUR: {_fmt_price(entry.get('eur', 0))}"
+                f"EUR: {_fmt_price(entry.get('eur', 0), 'eur')}"
             )
         else:
             data = (
@@ -933,7 +985,7 @@ async def cmd_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=5&page=1"
                 )
             ).json()
-            lines = ["🪙 *Top 5 por capitalização:*", ""]
+            lines = ["🪙 <b>Top 5 por capitalização:</b>", ""]
             for coin in data[:5]:
                 change = coin.get("price_change_percentage_24h") or 0
                 seta = "📈" if change >= 0 else "📉"
