@@ -296,6 +296,23 @@ class Playlist:
         except Exception:
             return None
 
+    async def resolver_lote(self, canais: list[Canal], simultaneos: int = 8) -> None:
+        """Preenche url_direto de todos os canais RKDY (links action=stream).
+
+        Cada resolução é um pedido leve (só se lê o Location do 302), por isso
+        uma lista de resultados inteira fica com links diretos "como os Rebel".
+        """
+        alvos = [c for c in canais if not c.url_direto and "action=stream" in c.url]
+        if not alvos:
+            return
+        sem = asyncio.Semaphore(max(1, simultaneos))
+
+        async def _um(c: Canal) -> None:
+            async with sem:
+                c.url_direto = await self.resolver(c.url)
+
+        await asyncio.gather(*[_um(c) for c in alvos], return_exceptions=True)
+
     async def validar_grupo(self, grupo: str, limite: int = 30) -> list[tuple[Canal, bool]]:
         """Valida até `limite` streams de uma categoria em paralelo (só canais com stream)."""
         canais = [c for c in await self.do_grupo(grupo, limite=limite * 2) if c.url][:limite]

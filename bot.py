@@ -2933,8 +2933,8 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     disable_web_page_preview=True,
                 )
                 return
-            await update.message.reply_text("⏳ A resolver o stream…")
-            direto = await pl.resolver(c.url)
+            # Reutiliza a resolução feita na lista, se existir; senão resolve agora
+            direto = c.url_direto or await pl.resolver(c.url)
             c.url_direto = direto
             if direto:
                 await update.message.reply_text(
@@ -2974,12 +2974,17 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"Sem resultados para “{html.escape(termo)}”.")
             return
         context.chat_data["iptv_last"] = res
+        # Pré-resolver os links RKDY: o link action=stream bloqueia browsers
+        # (Access Denied), mas o destino do redirect 302 abre em qualquer lado.
+        await pl.resolver_lote(res)
         linhas = [f"🔎 <b>Resultados para “{html.escape(termo)}”</b>\n{nota}"]
         for i, c in enumerate(res, 1):
-            if c.url:
+            alvo = c.url_direto or c.url
+            if alvo:
+                rotulo = "stream" if c.url_direto else "⚠️ stream (usar /canal)"
                 linhas.append(
                     f"{i}. {html.escape(c.nome)} → "
-                    f"<a href=\"{html.escape(c.url, quote=True)}\">stream</a>"
+                    f"<a href=\"{html.escape(alvo, quote=True)}\">{rotulo}</a>"
                 )
             elif c.web:
                 linhas.append(
@@ -2988,7 +2993,9 @@ async def cmd_canal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             else:
                 linhas.append(f"{i}. {html.escape(c.nome)}")
-        linhas.append("\nUsa <code>/canal &lt;n&gt;</code> para abrir o stream direto do resultado.")
+        linhas.append(
+            "\nUsa <code>/canal &lt;n&gt;</code> para reler o stream (tokens RKDY renovam a cada pedido)."
+        )
         await update.message.reply_text(
             "\n".join(linhas), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
