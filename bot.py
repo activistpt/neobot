@@ -2234,6 +2234,17 @@ async def cmd_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 _GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 _GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_gemini_cooldown: dict[str, float] = {}  # fonte -> timestamp até quando saltar (após 429)
+
+
+def _gemini_disponivel(fonte: str) -> bool:
+    """False se a última chamada devolveu 429 há menos de 30 min (tier sem quota)."""
+    return time.time() >= _gemini_cooldown.get(fonte, 0)
+
+
+def _quota_err(exc: Exception) -> bool:
+    s = str(exc)
+    return "429" in s or "quota" in s.lower() or "rate limit" in s.lower()
 
 
 def _lyria_generate(prompt: str, model: str = "lyria-3-clip-preview") -> tuple[bytes, str | None]:
@@ -2246,6 +2257,8 @@ def _lyria_generate(prompt: str, model: str = "lyria-3-clip-preview") -> tuple[b
         json={"model": model, "input": prompt},
         timeout=600,
     )
+    if resp.status_code == 429:
+        _gemini_cooldown["lyria"] = time.time() + 1800
     resp.raise_for_status()
     data = resp.json()
     audio_b64 = None
@@ -2272,6 +2285,8 @@ def _gemini_poll_video(prompt: str, model: str = "veo-3.1-fast-generate-preview"
         json={"instances": [{"prompt": prompt}]},
         timeout=120,
     )
+    if r.status_code == 429:
+        _gemini_cooldown["veo"] = time.time() + 1800
     r.raise_for_status()
     op_name = r.json().get("name")
     if not op_name:
@@ -2383,7 +2398,7 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     # ── Fonte primária: Lyria (Google — o motor por trás do Flow Music / flowmusic.app) ──
-    if _GEMINI_KEY:
+    if _GEMINI_KEY and _gemini_disponivel("lyria"):
         try:
             await thinking.edit_text(
                 "🎵 A gerar a música com o Lyria da Google (motor do Flow Music)... "
@@ -2859,7 +2874,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             logger.exception("Falha ao baixar imagem-URL em /video")
     # ── Fonte primária: Veo (Google — o motor por trás do flow.google) ──
-    if _GEMINI_KEY and not img_for_ltx:
+    if _GEMINI_KEY and _gemini_disponivel("veo") and not img_for_ltx:
         try:
             await thinking.edit_text(
                 "🎬 A gerar o vídeo com o Veo da Google (motor do Flow)... "
