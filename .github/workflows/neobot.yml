@@ -52,4 +52,5 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}   # quota ZeroGPU do /music (ACE-Step)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # Lyria (/music) + Veo (/video)
+          NEOBOT_HF_TOKENS: ${{ secrets.NEOBOT_HF_TOKENS }}   # tokens HF extra (rotação de quota ZeroGPU)
         run: python -X utf8 bot.py

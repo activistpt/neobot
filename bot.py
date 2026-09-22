@@ -2230,7 +2230,7 @@ async def cmd_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _download_and_send(update, url, audio_only=True, thinking_msg=thinking)
 
 
-# --- /music (Lyria 3.5 (Google, motor do Flow Music) + ACE-Step: geração de música) ---
+# --- /music (YuE open source + Lyria da Google + MusicGen: geração de música) ---
 
 _GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 _GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -2316,55 +2316,119 @@ def _gemini_poll_video(prompt: str, model: str = "veo-3.1-fast-generate-preview"
     raise RuntimeError("Veo timeout (10 min)")
 
 
-ACE_SPACE = "ACE-Step/Ace-Step-v1.5"
-ACE_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+YUE_SPACE = "mrfakename/yue2-3b"                          # YuE (open source): música cantada
+WAN_SPACE = "Saravutw/WAN2.2_I2V_LIGHTNING_4-8step_custom" # Wan2.2 Lightning (open source): vídeo
+HF_TOKEN_ENV = os.environ.get("HF_TOKEN", "").strip()
+_hf_dead_day: dict[str, int] = {}   # token -> dia em que ficou sem quota (ZeroGPU é diária)
+
+
+def _hf_tokens() -> list[str | None]:
+    """Tokens HF utilizáveis: principal + extras (secret NEOBOT_HF_TOKENS, separados por vírgula).
+    Cada conta gratuita tem quota ZeroGPU própria — a rotação multiplica a capacidade."""
+    toks: list[str | None] = []
+    if HF_TOKEN_ENV:
+        toks.append(HF_TOKEN_ENV)
+    for t in os.environ.get("NEOBOT_HF_TOKENS", "").split(","):
+        t = t.strip()
+        if t:
+            toks.append(t)
+    return toks or [None]
+
+
+def _hf_alive(tok: str | None) -> bool:
+    """False se este token ficou sem quota no dia corrente."""
+    return _hf_dead_day.get(tok or "", -1) != time.gmtime().tm_yday
+
+
+def _hf_mark_dead(tok: str | None) -> None:
+    _hf_dead_day[tok or ""] = time.gmtime().tm_yday
 
 # 1 pedido por utilizador a cada 10 min — a quota ZeroGPU é limitada
 _music_last: dict[int, float] = {}
 
 
-def _ace_client():
-    """Cria um gradio_client para o Space do ACE-Step (com HF token se houver)."""
-    from gradio_client import Client
-    return Client(ACE_SPACE, token=ACE_TOKEN or None, verbose=False)
+def _yue_generate(style: str, lyrics: str) -> str:
+    """Bloqueante — gera a música cantada no Space YuE (open source), com rotação
+    de tokens HF para multiplicar a quota ZeroGPU diária.
 
-
-def _ace_generate(prompt: str, lyrics: str, lang: str) -> str:
-    """Bloqueante — chama o /generation_wrapper do ACE-Step em modo custom.
-
-    Devolve o URL do MP3 gerado (sample 1) ou levanta exceção.
+    Devolve o caminho local do MP3 ou levanta exceção.
     """
-    c = _ace_client()
-    r = c.predict(
-        selected_model="acestep-v15-turbo",       # turbo = mais rápido (menos GPU)
-        generation_mode="custom",                  # letra fornecida por nós (via Groq)
-        simple_query_input=None,
-        simple_vocal_language="unknown",
-        param_4=prompt,                            # caption: estilo/instrumentação
-        param_5=lyrics,                            # letra com tags [verse]/[chorus]
-        param_6=0, param_7="", param_8="",
-        param_9=lang,                              # idioma vocal (pt/en/…)
-        param_10=8,                                # inference steps (turbo)
-        param_11=7.0,                              # guidance scale
-        param_12=True,                             # seed aleatória
-        param_13=-1, param_14=None,
-        param_15=-1,                               # duração: automática
-        param_16=1,                                # batch=1 (poupa quota GPU)
-        param_17=None, param_18=None,
-        param_19=0.0, param_20=-1,
-        param_23="text2music",
-        param_30="mp3",
-        param_32=False,                            # sem "thinking" da LM (poupa GPU)
-        param_37=False, param_38=False, param_39=False,
-        param_47=None,
-        api_name="/generation_wrapper",
-    )
-    # r é um NamedTuple; a 1.ª componente é o Sample 1 (gradio FileData)
-    sample1 = r[0]
-    url = getattr(sample1, "url", None) or getattr(sample1, "path", None)
-    if not url:
-        raise RuntimeError("ACE-Step não devolveu áudio")
-    return url
+    from gradio_client import Client
+    ultimo_erro: Exception | None = None
+    for tok in _hf_tokens():
+        if not _hf_alive(tok):
+            continue
+        try:
+            c = Client(YUE_SPACE, token=tok, verbose=False,
+                       httpx_kwargs={"timeout": 180})
+            r = c.predict(
+                style=(style or "pop song with modern production")[:300],
+                lyrics=lyrics,
+                planning_mode="off",      # sem planeamento LM (mais rápido, menos GPU)
+                render_quality=16,        # 16 = rápido / 32 = máxima qualidade
+                seed=random.randint(1, 999999),
+                api_name="/generate_song",
+            )
+            mp3 = r[0] if isinstance(r, (tuple, list)) and r else None
+            if not mp3 or not os.path.exists(str(mp3)):
+                raise RuntimeError("YuE não devolveu áudio")
+            return str(mp3)
+        except Exception as exc:
+            if "quota" in str(exc).lower() or "gpu duration" in str(exc).lower():
+                _hf_mark_dead(tok)
+                ultimo_erro = exc
+                continue
+            raise
+    if ultimo_erro:
+        raise ultimo_erro
+    raise RuntimeError("Sem quota ZeroGPU disponível hoje (todas as contas HF esgotadas)")
+
+
+def _run_wan(image_path: str, prompt: str) -> str:
+    """Bloqueante — anima uma imagem com Wan2.2 I2V Lightning (open source, 4 passos),
+    com rotação de tokens HF.
+
+    Devolve o caminho local do MP4 ou levanta exceção.
+    """
+    from gradio_client import Client, handle_file
+    ultimo_erro: Exception | None = None
+    for tok in _hf_tokens():
+        if not _hf_alive(tok):
+            continue
+        try:
+            c = Client(WAN_SPACE, token=tok, verbose=False,
+                       httpx_kwargs={"timeout": 240})
+            r = c.predict(
+                input_image=handle_file(image_path),
+                last_image=handle_file(image_path),   # 1.º frame = último → vídeo em loop
+                prompt=(prompt or "high quality, cinematic motion, smooth animation")[:400],
+                steps=4,
+                negative_prompt="blurry, low quality, chaotic, deformed, watermark, shaky camera",
+                duration_seconds=3.5,
+                guidance_scale=1, guidance_scale_2=1,
+                seed=random.randint(1, 999999),
+                randomize_seed=True,
+                quality=5,
+                scheduler="FlowMatchEulerDiscrete",
+                flow_shift=3.0,
+                frame_multiplier=16,
+                safe_mode=False,
+                video_component=None,
+                api_name="/generate_video",
+            )
+            vid = r[1] if isinstance(r, (tuple, list)) and len(r) > 1 else None
+            if not vid or not os.path.exists(str(vid)):
+                raise RuntimeError("Wan não devolveu vídeo")
+            return str(vid)
+        except Exception as exc:
+            if "quota" in str(exc).lower() or "gpu duration" in str(exc).lower():
+                _hf_mark_dead(tok)
+                ultimo_erro = exc
+                continue
+            raise
+    if ultimo_erro:
+        raise ultimo_erro
+    raise RuntimeError("Sem quota ZeroGPU disponível hoje (todas as contas HF esgotadas)")
 
 
 async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2375,9 +2439,9 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Exemplos:\n"
             "· `/music uma balada sobre saudade de Lisboa`\n"
             "· `/music rap engraçado sobre exames`\n\n"
-            "🤖 A música é gerada pelo Lyria da Google (o motor do Flow Music). "
-            "Se estiver indisponível, usa o motor alternativo: letra pela IA (Groq) + ACE-Step. "
-            "Pode demorar 2-4 minutos.",
+            "🤖 A música é gerada pelo YuE (modelo open source que canta a letra escrita "
+            "pela IA). Se estiver indisponível, tenta o Lyria da Google ou o MusicGen. "
+            "Pode demorar 1-2 minutos.",
             parse_mode="Markdown",
         )
         return
@@ -2431,16 +2495,16 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
             return
         except Exception:
-            logger.exception("Lyria falhou em /music — uso o ACE-Step")
+            logger.exception("Lyria falhou em /music — uso o YuE")
             try:
                 await thinking.edit_text(
                     "🔄 O Lyria da Google não respondeu — a gerar pelo motor alternativo "
-                    "(letra com IA + ACE-Step)..."
+                    "(letra com IA + YuE)..."
                 )
             except Exception:
                 pass
 
-    # 1) Groq escreve a letra personalizada em formato ACE-Step
+    # 1) Groq escreve a letra personalizada (tags [verse]/[chorus] que o YuE entende)
     system = (
         "Escreve a letra completa de uma canção original em português de Portugal. "
         "Usa EXATAMENTE este formato com tags em inglês e versos curtos (2-4 linhas cada): "
@@ -2472,16 +2536,16 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await thinking.edit_text(
         f"🎵 Letra pronta ({len(letra.splitlines())} linhas)!\n🎚 Estilo: {style[:100]}\n\n"
-        "🎹 A gerar a música no ACE-Step... (1-2 minutos)"
+        "🎹 A gerar a música com o YuE (open source, canta a letra)... (1-2 minutos)"
     )
 
-    # 2) ACE-Step gera o áudio (bloqueante → thread)
+    # 2) YuE gera a música cantada (bloqueante → thread)
     import tempfile as _tfd
     tmpdir = _tfd.mkdtemp(prefix="neobot_music_")
     try:
-        audio_url = await asyncio.to_thread(_ace_generate, style, letra, "pt")
+        dest = await asyncio.to_thread(_yue_generate, style, letra)
     except Exception as exc:
-        logger.exception("ACE-Step falhou em /music")
+        logger.exception("YuE falhou em /music")
         if "quota" in str(exc).lower() or "GPU" in str(exc):
             await thinking.edit_text(
                 "⏳ GPU gratuita esgotada — a gerar uma versão instrumental na CPU do servidor "
@@ -2520,30 +2584,23 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await thinking.edit_text("❌ A geração de música falhou. Tenta outra vez dentro de alguns minutos.")
         return
 
-    # 3) descarregar e enviar
-    import urllib.request as _ur
-    dest = os.path.join(tmpdir, "neobot_music.mp3")
+    # 3) enviar (o YuE já devolve o ficheiro local)
     try:
-        req = _ur.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
-        with _ur.urlopen(req, timeout=120) as resp, open(dest, "wb") as fh:
-            fh.write(resp.read())
         if os.path.getsize(dest) > TG_FILE_LIMIT:
-            await thinking.edit_text(
-                f"✅ Música gerada, mas o ficheiro excede 50 MB. Ouve aqui: {audio_url}"
-            )
+            await thinking.edit_text("✅ Música gerada, mas o ficheiro excede 50 MB.")
             return
         titulo = html.escape(tema[:60])
         await update.message.reply_audio(
             audio=open(dest, "rb"),
             title=tema[:60],
-            performer="NEOBOT · ACE-Step",
+            performer="NEOBOT · YuE",
             caption=f"🎼 {titulo}\n🎚 {html.escape(style[:100])}",
             parse_mode=ParseMode.HTML,
         )
         await thinking.delete()
     except Exception:
         logger.exception("Falha ao enviar /music")
-        await thinking.edit_text(f"✅ Música gerada, mas o envio falhou. Ouve aqui: {audio_url}")
+        await thinking.edit_text("❌ A música foi gerada mas o envio falhou. Tenta outra vez.")
     finally:
         for f in [dest]:
             try:
@@ -2873,7 +2930,49 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             texto = "A cena da imagem ganha vida com movimento suave"
         except Exception:
             logger.exception("Falha ao baixar imagem-URL em /video")
-    # ── Fonte primária: Veo (Google — o motor por trás do flow.google) ──
+    # ── Fonte principal: Wan2.2 Lightning (open source) — gera a imagem inicial e anima ──
+    wan_path = None
+    try:
+        if not img_for_ltx:
+            try:
+                u = (
+                    "https://image.pollinations.ai/prompt/" + urllib.parse.quote(texto[:300])
+                    + f"?width=768&height=768&nologo=true&model=z-image&seed={random.randint(1, 999999)}"
+                )
+                resp = await _http_get(u, timeout=120)
+                fd, img_for_ltx = tempfile.mkstemp(suffix=".jpg")
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(resp.content)
+            except Exception:
+                logger.exception("Falha ao gerar imagem inicial para o Wan")
+        if img_for_ltx:
+            try:
+                await thinking.edit_text("🎬 A animar com o Wan2.2 (open source)... 1-2 minutos")
+            except Exception:
+                pass
+            wan_path = await asyncio.to_thread(_run_wan, img_for_ltx, texto)
+    except Exception:
+        logger.exception("Wan falhou em /video — tento o LTX")
+        wan_path = None
+    if wan_path:
+        try:
+            await update.message.reply_video(
+                video=open(wan_path, "rb"),
+                caption=f"🎬 {html.escape(texto[:120])}\n🤖 Wan2.2 I2V · open source",
+                parse_mode=ParseMode.HTML,
+            )
+            await thinking.delete()
+        except Exception:
+            logger.exception("Falha ao enviar vídeo Wan")
+            await thinking.edit_text("❌ O vídeo foi gerado mas o envio falhou. Tenta outra vez.")
+        finally:
+            try:
+                os.remove(wan_path)
+            except OSError:
+                pass
+        return
+
+    # ── Fonte secundária: Veo (Google — o motor por trás do flow.google) ──
     if _GEMINI_KEY and _gemini_disponivel("veo") and not img_for_ltx:
         try:
             await thinking.edit_text(
