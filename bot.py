@@ -2230,7 +2230,76 @@ async def cmd_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _download_and_send(update, url, audio_only=True, thinking_msg=thinking)
 
 
-# --- /music (ACE-Step: geração de música com letras personalizadas) ---
+# --- /music (Lyria 3.5 (Google, motor do Flow Music) + ACE-Step: geração de música) ---
+
+_GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def _lyria_generate(prompt: str, model: str = "lyria-3-clip-preview") -> tuple[bytes, str | None]:
+    """Gera música com o Lyria da Google (o motor por trás do Flow Music / flowmusic.app)
+    via Gemini API (Interactions). Bloqueante. Devolve (mp3_bytes, letra_ou_None)."""
+    import base64 as _b64
+    resp = httpx.post(
+        f"{_GEMINI_BASE}/interactions",
+        headers={"x-goog-api-key": _GEMINI_KEY, "Content-Type": "application/json"},
+        json={"model": model, "input": prompt},
+        timeout=600,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    audio_b64 = None
+    letra = None
+    for step in data.get("steps", []):
+        if step.get("type") != "model_output":
+            continue
+        for block in step.get("content", []):
+            if block.get("type") == "audio" and block.get("data"):
+                audio_b64 = block["data"]
+            elif block.get("type") == "text" and block.get("text") and not letra:
+                letra = block["text"]
+    if not audio_b64:
+        raise RuntimeError("Lyria não devolveu áudio")
+    return _b64.b64decode(audio_b64), letra
+
+
+def _gemini_poll_video(prompt: str, model: str = "veo-3.1-fast-generate-preview") -> str | None:
+    """Gera vídeo com o Veo (Google, motor do flow.google) via Gemini API
+    (predictLongRunning + polling). Bloqueante. Devolve o URL do MP4 ou None."""
+    r = httpx.post(
+        f"{_GEMINI_BASE}/models/{model}:predictLongRunning",
+        headers={"x-goog-api-key": _GEMINI_KEY, "Content-Type": "application/json"},
+        json={"instances": [{"prompt": prompt}]},
+        timeout=120,
+    )
+    r.raise_for_status()
+    op_name = r.json().get("name")
+    if not op_name:
+        raise RuntimeError("Veo não devolveu operação")
+    for _ in range(60):  # até 10 min
+        time.sleep(10)
+        st = httpx.get(
+            f"{_GEMINI_BASE}/{op_name}",
+            headers={"x-goog-api-key": _GEMINI_KEY},
+            timeout=60,
+        )
+        st.raise_for_status()
+        sj = st.json()
+        if sj.get("done"):
+            if sj.get("error"):
+                raise RuntimeError(f"Veo erro: {sj['error'].get('message', '?')}")
+            try:
+                uri = sj["response"]["generateVideoResponse"]["generatedSamples"][0]["video"]["uri"]
+            except (KeyError, IndexError):
+                raise RuntimeError("Veo devolveu resposta sem vídeo")
+            dl = httpx.get(
+                uri, headers={"x-goog-api-key": _GEMINI_KEY},
+                timeout=300, follow_redirects=True,
+            )
+            dl.raise_for_status()
+            return dl.content
+    raise RuntimeError("Veo timeout (10 min)")
+
 
 ACE_SPACE = "ACE-Step/Ace-Step-v1.5"
 ACE_TOKEN = os.environ.get("HF_TOKEN", "").strip()
@@ -2291,8 +2360,9 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Exemplos:\n"
             "· `/music uma balada sobre saudade de Lisboa`\n"
             "· `/music rap engraçado sobre exames`\n\n"
-            "🤖 A letra é escrita pela IA (Groq) e a música gerada pelo "
-            "ACE-Step (modelo aberto estilo Suno). Pode demorar 1-2 minutos.",
+            "🤖 A música é gerada pelo Lyria da Google (o motor do Flow Music). "
+            "Se estiver indisponível, usa o motor alternativo: letra pela IA (Groq) + ACE-Step. "
+            "Pode demorar 2-4 minutos.",
             parse_mode="Markdown",
         )
         return
@@ -2311,6 +2381,49 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     thinking = await update.message.reply_text(
         "🎼 A escrever a letra com a IA... (depois gero a música — pode demorar 1-2 min)"
     )
+
+    # ── Fonte primária: Lyria (Google — o motor por trás do Flow Music / flowmusic.app) ──
+    if _GEMINI_KEY:
+        try:
+            await thinking.edit_text(
+                "🎵 A gerar a música com o Lyria da Google (motor do Flow Music)... "
+                "pode demorar 2-4 minutos"
+            )
+            audio_lyria, letra_lyria = await asyncio.to_thread(
+                _lyria_generate,
+                f"Cria uma música original cantada em português de Portugal sobre: {tema}. "
+                "Estrutura completa com versos, refrão e ponte. Produção musical moderna.",
+            )
+            tmpdir_m = tempfile.mkdtemp(prefix="neobot_lyria_")
+            dest_m = os.path.join(tmpdir_m, "neobot_lyria.mp3")
+            with open(dest_m, "wb") as fh:
+                fh.write(audio_lyria)
+            if os.path.getsize(dest_m) > TG_FILE_LIMIT:
+                raise RuntimeError("ficheiro excede 50 MB")
+            cap = f"🎼 {html.escape(tema[:60])}\n🤖 Lyria · Google Flow Music"
+            await update.message.reply_audio(
+                audio=open(dest_m, "rb"),
+                title=tema[:60],
+                performer="NEOBOT · Lyria (Google)",
+                caption=cap,
+                parse_mode=ParseMode.HTML,
+            )
+            await thinking.delete()
+            try:
+                os.remove(dest_m)
+                os.rmdir(tmpdir_m)
+            except OSError:
+                pass
+            return
+        except Exception:
+            logger.exception("Lyria falhou em /music — uso o ACE-Step")
+            try:
+                await thinking.edit_text(
+                    "🔄 O Lyria da Google não respondeu — a gerar pelo motor alternativo "
+                    "(letra com IA + ACE-Step)..."
+                )
+            except Exception:
+                pass
 
     # 1) Groq escreve a letra personalizada em formato ACE-Step
     system = (
@@ -2745,6 +2858,30 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             texto = "A cena da imagem ganha vida com movimento suave"
         except Exception:
             logger.exception("Falha ao baixar imagem-URL em /video")
+    # ── Fonte primária: Veo (Google — o motor por trás do flow.google) ──
+    if _GEMINI_KEY and not img_for_ltx:
+        try:
+            await thinking.edit_text(
+                "🎬 A gerar o vídeo com o Veo da Google (motor do Flow)... "
+                "pode demorar 2-6 minutos"
+            )
+            payload_veo = await asyncio.to_thread(_gemini_poll_video, texto)
+            cap_v = f"🎬 {html.escape(texto[:120])}\n🤖 Veo · Google Flow"
+            try:
+                await update.message.reply_video(video=payload_veo, caption=cap_v, parse_mode=ParseMode.HTML)
+                await thinking.delete()
+            except Exception:
+                logger.exception("Falha ao enviar vídeo Veo")
+                await thinking.edit_text("🎬 O vídeo foi gerado mas o envio falhou. Tenta outra vez.")
+            return
+        except Exception:
+            logger.exception("Veo falhou em /video — uso o LTX")
+            try:
+                await thinking.edit_text(
+                    "🔄 O Veo da Google não respondeu — a gerar pelo motor alternativo (LTX-Video)..."
+                )
+            except Exception:
+                pass
     loop = asyncio.get_running_loop()
     try:
         res = await loop.run_in_executor(None, _run_ltx, texto, img_for_ltx, 3.0, 512.0, 704.0)
