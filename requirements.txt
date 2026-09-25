@@ -6,3 +6,4 @@ gradio_client>=1.0
 # yt-dlp é o que a app Seal usa — nunca fica bloqueado pelo YouTube.
 yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.tar.gz
 phonenumbers>=8.13
+edge-tts>=7.0

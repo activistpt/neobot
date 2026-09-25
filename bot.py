@@ -29,6 +29,11 @@ try:  # optional dependency for /phone
     from phonenumbers import timezone as _pn_timezone
 except ImportError:
     phonenumbers = None
+
+try:  # optional dependency for /voz (TTS neural pt-PT, gratuito, sem chave)
+    import edge_tts
+except ImportError:
+    edge_tts = None
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -202,6 +207,7 @@ def teclado_menu():
         "▪️ /wiki — pesquisa na Wikipédia (ex: `/wiki Portugal`)\n"
         "▪️ /image — gera uma imagem (ex: `/image gato astronauta`)\n"
         "▪️ /audio — gera um clipe de voz com a frase que você escrever (ex: `/audio bem-vindos ao grupo`)\n"
+        "▪️ /voz — clipe de voz em português de Portugal 🇵🇹 (ex: `/voz boa noite` ou `/voz raquel olá!`)\n"
         "▪️ /meteo — meteorologia (ex: `/meteo Lisboa`)\n"
         "▪️ /youtube — pesquisa no YouTube (ex: `/youtube tutorial python`)\n"
         "▪️ /crypto — preços de crypto (ex: `/crypto btc`)\n"
@@ -782,6 +788,75 @@ async def cmd_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logger.exception("Falha ao enviar voz /audio")
         await thinking.edit_text("❌ A voz foi gerada, mas o Telegram não aceitou o ficheiro. Tenta algo mais curto.")
+
+
+# --- /voz (TTS neural pt-PT via edge-tts: vozes Duarte e Raquel) ---
+
+_VOZES_PT = {
+    "duarte": "pt-PT-DuarteNeural",   # masculina (default)
+    "raquel": "pt-PT-RaquelNeural",   # feminina
+}
+_VOZ_LIMITE = 3000
+
+
+async def _voz_gerar(texto: str, voz: str) -> bytes | None:
+    """Gera MP3 pt-PT com o edge-tts (Microsoft Neural, gratuito, sem chave)."""
+    if edge_tts is None:
+        return None
+    comunicar = edge_tts.Communicate(texto, voz)
+    buf = bytearray()
+    async for chunk in comunicar.stream():
+        if chunk["type"] == "audio":
+            buf.extend(chunk["data"])
+    return bytes(buf) or None
+
+
+async def cmd_voz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde com um clip de voz em português de Portugal (Duarte/Raquel)."""
+    texto = " ".join(context.args).strip()
+    voz = _VOZES_PT["duarte"]
+    # /voz raquel <texto> | /voz duarte <texto> — escolha de voz
+    partes = texto.split(" ", 1)
+    if len(partes) == 2 and partes[0].lower() in _VOZES_PT:
+        voz = _VOZES_PT[partes[0].lower()]
+        texto = partes[1].strip()
+    if not texto:
+        await update.message.reply_text(
+            "🎙 *Voz pt-PT*\n\n"
+            "Usa: `/voz <texto>` — voz do Duarte (masculina)\n"
+            "Ou: `/voz raquel <texto>` — voz da Raquel (feminina)\n\n"
+            "Exemplo: `/voz boa noite, até amanhã!`",
+            parse_mode="Markdown",
+        )
+        return
+    user = update.effective_user
+    if user and _rate_limited(user.id):
+        await update.message.reply_text("⏳ Muitos pedidos seguidos! Espera um pouco.")
+        return
+    if len(texto) > _VOZ_LIMITE:
+        await update.message.reply_text(f"✂️ Texto demasiado longo — máximo de {_VOZ_LIMITE} caracteres.")
+        return
+    thinking = await update.message.reply_text("🎙 A gerar a voz pt-PT...")
+    try:
+        audio = await asyncio.wait_for(_voz_gerar(texto, voz), timeout=90)
+    except Exception:
+        logger.exception("Falha /voz")
+        await thinking.edit_text("❌ Não consegui gerar a voz agora. Tenta outra vez num instante.")
+        return
+    if not audio:
+        await thinking.edit_text("❌ O motor de voz não está disponível neste ambiente.")
+        return
+    nome = "Duarte" if voz.endswith("DuarteNeural") else "Raquel"
+    try:
+        await update.message.reply_voice(
+            voice=audio,
+            caption=f"🎙 {nome} • {html.escape(texto[:140])}",
+            parse_mode=ParseMode.HTML,
+        )
+        await thinking.delete()
+    except Exception:
+        logger.exception("Falha ao enviar voz /voz")
+        await thinking.edit_text("❌ A voz foi gerada, mas o Telegram não aceitou o ficheiro.")
 
 
 # --- /meteo (Open-Meteo) ---
@@ -3712,6 +3787,7 @@ async def _post_init(app: Application) -> None:
                 BotCommand("radio", "Rádios portuguesas"),
                 BotCommand("streamhub", "Sites de streaming"),
                 BotCommand("capcut", "Alternativas ao CapCut 🎬"),
+                BotCommand("voz", "Voz pt-PT: lê o teu texto 🎙"),
                 BotCommand("hora", "Que horas são"),
                 BotCommand("opencode", "OpenCode: tarefa de código 🤖"),
             ]
@@ -3774,6 +3850,7 @@ def main() -> None:
     app.add_handler(CommandHandler("video", cmd_video))
     app.add_handler(CommandHandler("streamhub", cmd_streamhub))
     app.add_handler(CommandHandler("capcut", cmd_capcut))
+    app.add_handler(CommandHandler("voz", cmd_voz))
     app.add_handler(CommandHandler("iptv", cmd_iptv))
     app.add_handler(CommandHandler("canal", cmd_canal))
     app.add_handler(CommandHandler("webcams", cmd_webcams))
