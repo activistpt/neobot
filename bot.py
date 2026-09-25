@@ -206,7 +206,7 @@ def teclado_menu():
         "▪️ /news — notícias da atualidade (ex: `/news tecnologia`)\n"
         "▪️ /wiki — pesquisa na Wikipédia (ex: `/wiki Portugal`)\n"
         "▪️ /image — gera uma imagem (ex: `/image gato astronauta`)\n"
-        "▪️ /audio — pergunta por texto e ouve a resposta em voz 🎙 (ex: `/audio quem é o presidente da República?`)\n"
+        "▪️ /audio — pergunta qualquer coisa: pesquiso na web e respondo em voz 🎙 (ex: `/audio notícias de hoje`)\n"
         "▪️ /voz — clipe de voz em português de Portugal 🇵🇹 (ex: `/voz boa noite` ou `/voz raquel olá!`)\n"
         "▪️ /ouvir — envia um clip de voz e ele responde com texto + IA 🎙 (ou responde a um voice com `/ouvir`)\n"
         "▪️ /falar — o mesmo, mas a resposta chega em voz pt-PT (ex: responde a um voice com `/falar raquel`)\n"
@@ -729,13 +729,14 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await thinking.edit_text(f"🎨 A imagem foi gerada, mas não consegui enviá-la. Vê aqui:\n{url}")
 
 
-# --- /audio: pergunta por texto e recebe a resposta em voz; clips de voz são respondidos em voz ---
+# --- /audio: pesquisa na web e responde por voz a tudo o que seja pedido ---
 
-_AUDIO_AI_SYSTEM = (
-    "You are NEOBOT's voice mode. The user's message will be read aloud as a voice note. "
-    "If the message is a question or a request for information, answer it concisely "
-    "(under 90 words) in Portuguese of Portugal, plain text, no markdown, no lists. "
-    "If the message is not a question (a greeting, an announcement or text meant to be read), "
+_AUDIO_WEB_SYSTEM = (
+    "You are NEOBOT's voice mode. You receive the user's text plus fresh web search results. "
+    "If the text is a question or request for information, answer it using the search results "
+    "in Portuguese of Portugal, under 90 words, spoken style (plain text, no markdown, no lists, no URLs). "
+    "If the results are irrelevant or missing, answer from your own knowledge. "
+    "If the text is NOT a question (a greeting, an announcement or text meant to be read out loud), "
     "reply with exactly the same text, unchanged."
 )
 
@@ -772,7 +773,7 @@ async def _tts_fallback_google(texto: str) -> bytes | None:
     return bytes(audio) or None
 
 
-async def _responder_em_voz(msg, thinking, texto_lido: str, resposta: str, voz: str) -> None:
+async def _responder_em_voz(msg, thinking, texto_lido: str, resposta: str, voz: str, fonte: str = "") -> None:
     """Converte a resposta em voz pt-PT e envia como nota de voz (fallback Google)."""
     nome = "Duarte" if voz.endswith("DuarteNeural") else "Raquel"
     audio = None
@@ -790,6 +791,8 @@ async def _responder_em_voz(msg, thinking, texto_lido: str, resposta: str, voz: 
     caption = f"🗣 {html.escape(texto_lido[:140])}"
     if resposta.strip() != texto_lido.strip():
         caption += f"\n🤖 {html.escape(resposta[:300])}"
+    if fonte:
+        caption += f"\n🔗 {html.escape(fonte)}"
     caption += f"\n🎙 {nome}"
     try:
         await msg.reply_voice(voice=audio, caption=caption, parse_mode=ParseMode.HTML)
@@ -818,8 +821,9 @@ async def cmd_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not texto:
         await msg.reply_text(
-            "🎙 *Audio — fala comigo por voz*\n\n"
-            "• `/audio quem ganhou o jogo do Porto?` → respondo em áudio\n"
+            "🎙 *Audio — pergunta qualquer coisa, respondo em voz*\n\n"
+            "• `/audio quem ganhou as eleições?` → pesquiso na web e respondo em voz\n"
+            "• `/audio previsão do tempo para amanhã em Lisboa` → resposta atualizada em voz\n"
             "• `/audio bem-vindos ao grupo!` → leio o teu texto em voz\n"
             "• `/audio raquel <texto>` → voz feminina\n"
             "• Responde a um clip de voz com `/audio` → respondo em áudio ao que disseste",
@@ -833,19 +837,39 @@ async def cmd_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("✂️ Texto demasiado longo — máximo de 1000 caracteres.")
         return
 
-    thinking = await msg.reply_text("🎙 A pensar e a preparar a voz...")
+    thinking = await msg.reply_text("🌐 A pesquisar e a preparar a voz...")
+
+    # Pesquisa web sempre (reutiliza o motor do /google); a IA decide se usa
+    # os resultados (pergunta) ou se lê o texto tal e qual (anúncio/leitura).
     resposta = ""
+    fonte = ""
+    try:
+        resultados = await _ddg_search(texto, limit=5)
+    except Exception:
+        logger.exception("Pesquisa falhou no /audio")
+        resultados = []
     if _groq_key():
         try:
+            if resultados:
+                contexto_web = "\n".join(
+                    f"[{i + 1}] {t} — {s} (fonte: {u})" for i, (t, u, s) in enumerate(resultados)
+                )
+                user_content = f"Texto do utilizador: {texto}\n\nResultados da pesquisa:\n{contexto_web}"
+                fonte = urllib.parse.urlparse(resultados[0][1]).netloc or ""
+            else:
+                user_content = f"Texto do utilizador: {texto}"
             resposta = (
-                await asyncio.wait_for(_groq_chat(GROQ_MODEL, _AUDIO_AI_SYSTEM, texto), timeout=60)
+                await asyncio.wait_for(
+                    _groq_chat(GROQ_MODEL, _AUDIO_WEB_SYSTEM, user_content, max_tokens=500),
+                    timeout=60,
+                )
             ).strip()
         except Exception:
             logger.exception("IA falhou no /audio")
             resposta = ""
     if not resposta:
         resposta = texto  # sem IA disponível: lê o texto tal e qual
-    await _responder_em_voz(msg, thinking, texto, resposta, voz)
+    await _responder_em_voz(msg, thinking, texto, resposta, voz, fonte)
 
 
 # --- /voz (TTS neural pt-PT via edge-tts: vozes Duarte e Raquel) ---
@@ -1025,9 +1049,23 @@ async def _processar_voz(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
         await thinking.edit_text("🤔 Não percebi nada no áudio (silêncio?).")
         return
 
+    # Pesquisa web também no fluxo de voz (reutiliza o motor do /google):
+    # a IA usa os resultados se for pergunta; se for anúncio, lê tal e qual.
     try:
+        resultados = await _ddg_search(texto, limit=5)
+    except Exception:
+        logger.exception("Pesquisa falhou no fluxo de voz")
+        resultados = []
+    try:
+        if resultados:
+            contexto_web = "\n".join(
+                f"[{i + 1}] {t} — {s} (fonte: {u})" for i, (t, u, s) in enumerate(resultados)
+            )
+            user_content = f"Texto do utilizador: {texto}\n\nResultados da pesquisa:\n{contexto_web}"
+        else:
+            user_content = f"Texto do utilizador: {texto}"
         resposta = await asyncio.wait_for(
-            _groq_chat(GROQ_MODEL, GROQ_SYSTEM_PROMPT, texto), timeout=60
+            _groq_chat(GROQ_MODEL, _AUDIO_WEB_SYSTEM, user_content, max_tokens=500), timeout=60
         )
     except Exception:
         logger.exception("IA falhou no fluxo de voz")
