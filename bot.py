@@ -966,34 +966,45 @@ async def _transcrever_audio(dados: bytes, nome: str) -> str:
     comprovado a funcionar da rede do Actions) -> Groq -> HF router."""
     erros: list[str] = []
 
-    # 1º motor: Space público openai/whisper (gradio, sem quota ZeroGPU)
-    try:
-        def _space_transcribe() -> str:
-            from gradio_client import Client, handle_file
+    # 1º motor: Space público openai/whisper (gradio) COM token HF e rotação —
+    # anónimo esgota logo o limite de runs ZeroGPU (era a causa das falhas no Actions)
+    for tok in _hf_tokens():
+        if not _hf_alive(tok):
+            continue
+        try:
+            def _space_transcribe(t: str | None) -> str:
+                from gradio_client import Client, handle_file
 
-            ext = os.path.splitext(nome)[1] or ".ogg"
-            tmp = os.path.join(tempfile.gettempdir(), f"whisper_in_{os.getpid()}{ext}")
-            with open(tmp, "wb") as fh:
-                fh.write(dados)
-            try:
-                cliente = Client("openai/whisper")
-                resultado = cliente.predict(inputs=handle_file(tmp))
-            finally:
+                ext = os.path.splitext(nome)[1] or ".ogg"
+                tmp = os.path.join(tempfile.gettempdir(), f"whisper_in_{os.getpid()}{ext}")
+                with open(tmp, "wb") as fh:
+                    fh.write(dados)
                 try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-            if isinstance(resultado, (list, tuple)) and resultado:
-                resultado = resultado[0]
-            return str(resultado).strip()
+                    cliente = Client("openai/whisper", token=t)
+                    resultado = cliente.predict(inputs=handle_file(tmp))
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                if isinstance(resultado, (list, tuple)) and resultado:
+                    resultado = resultado[0]
+                return str(resultado).strip()
 
-        texto = await asyncio.to_thread(_space_transcribe)
-        if texto:
-            return texto
-        erros.append("Space openai/whisper: resposta vazia")
-    except Exception as e:
-        erros.append(f"Space: {e}")
-        logger.warning("Whisper Space falhou: %s", str(e)[:140])
+            texto = await asyncio.to_thread(_space_transcribe, tok)
+            if texto:
+                return texto
+            erros.append("Space: resposta vazia")
+        except Exception as e:
+            msg = str(e).lower()
+            if "quota" in msg or "zerogpu" in msg or "runs limit" in msg or "gpu" in msg:
+                _hf_mark_dead(tok)
+                erros.append(f"Space: {str(e)[:90]}")
+                logger.warning("Whisper Space sem quota (token %s) — tento próximo", (tok or "anon")[:6])
+                continue
+            erros.append(f"Space: {str(e)[:90]}")
+            logger.warning("Whisper Space falhou: %s", str(e)[:140])
+            continue
 
     # 2º motor: Groq (rápido quando a Cloudflare deixa passar)
     if _groq_key():
