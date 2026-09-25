@@ -227,6 +227,7 @@ def teclado_menu():
         "▪️ /radio — rádios portuguesas + rádio parceira HellGate 🌟\n"
         "▪️ /music — gera uma música original com a tua descrição 🎼 (ex: `/music balada sobre Coimbra`)\n"
         "▪️ /streamhub — sites de streaming: filmes, séries e IPTV 📺 (ex: `/streamhub filmes`)\n"
+        "▪️ /kodi — Kodi: download, repositório NEO IPTV e player 🎬\n"
         "▪️ /capcut — alternativas grátis ao CapCut 💻 (ex: `/capcut pc`)\n"
         "▪️ /iptv — IPTV mundial por página web: categorias 📡 (ex: `/iptv web`)\n"
         "▪️ /canal — procura canais IPTV 📺 (ex: `/canal sport tv`)\n"
@@ -3779,6 +3780,29 @@ CAPCUT_WEB = [
 ]
 
 
+# --- /kodi: media center + repositório e player NEO IPTV ---
+
+KODI_DOWNLOAD = "https://kodi.tv/download/"
+KODI_REPO = "https://neoiptv.surge.sh"
+NEO_IPTV = "https://ptlegion.itch.io/neo-iptv"
+
+
+async def cmd_kodi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Info do Kodi: download oficial, repositório NEO IPTV e player NEO IPTV."""
+    texto = (
+        "🎬 <b>KODI — Media Center</b>\n\n"
+        f"⬇️ <b>Download oficial</b> (Windows/Mac/Linux/Android/Raspberry):\n"
+        f"<a href=\"{KODI_DOWNLOAD}\">kodi.tv/download</a>\n\n"
+        f"📦 <b>Repositório NEO IPTV</b> (instala add-ons dentro do Kodi):\n"
+        f"<a href=\"{KODI_REPO}\">neoiptv.surge.sh</a>\n\n"
+        f"📺 <b>NEO IPTV Player</b> (Android):\n"
+        f"<a href=\"{NEO_IPTV}\">ptlegion.itch.io/neo-iptv</a>\n\n"
+        "💡 Instala o Kodi → adiciona a fonte do repositório → instala os add-ons "
+        "→ abre listas IPTV com /iptv ou canais com /canal."
+    )
+    await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
 async def cmd_capcut(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Alternativas opensource e web ao CapCut, com downloads diretos."""
     cat = " ".join(context.args).strip().lower() if context.args else ""
@@ -4083,6 +4107,7 @@ async def _post_init(app: Application) -> None:
                 BotCommand("mp3", "Extrair áudio de um link"),
                 BotCommand("radio", "Rádios portuguesas"),
                 BotCommand("streamhub", "Sites de streaming"),
+                BotCommand("kodi", "Kodi + NEO IPTV 🎬"),
                 BotCommand("capcut", "Alternativas ao CapCut 🎬"),
                 BotCommand("voz", "Voz pt-PT: lê o teu texto 🎙"),
                 BotCommand("audio", "Pergunta e ouve a resposta 🎙"),
@@ -4148,6 +4173,7 @@ def main() -> None:
     app.add_handler(CommandHandler("video", cmd_video))
     app.add_handler(CommandHandler("streamhub", cmd_streamhub))
     app.add_handler(CommandHandler("capcut", cmd_capcut))
+    app.add_handler(CommandHandler("kodi", cmd_kodi))
     app.add_handler(CommandHandler("voz", cmd_voz))
     # Nota de voz/áudio recebida (sem comando): transcreve e responde em voz pt-PT
     app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, ao_receber_voz))
