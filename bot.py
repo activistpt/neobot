@@ -233,7 +233,6 @@ def teclado_menu():
         "▪️ /video — gera vídeo a partir de texto ou anima uma imagem 🎬 (ex: `/video um dragão a voar`)\n"
         "▪️ /opencode — executa uma tarefa de código via OpenCode local 🤖 (ex: `/opencode lista os ficheiros`)\n"
         "▪️ `/opencode_status` — estado da sessão OpenCode interativa\n"
-        "▪️ /avatar — avatar falante: responde a uma foto com `/avatar olá!` 🗣\n"
         "▪️ /ajuda — mostra esta mensagem\n\n"
         "Escolhe um botão abaixo ou escreve um comando! 👇"
     )
@@ -3248,7 +3247,7 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
-# --- /video (texto→vídeo e imagem→vídeo via LTX-Video + avatar via EchoMimic) ---
+# --- /video (texto→vídeo e imagem→vídeo via LTX/Wan) ---
 
 VIDEO_NEGATIVE = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
@@ -3378,49 +3377,6 @@ def _run_ltx(
     return payload, video_url
 
 
-def _run_echo_avatar(image_path: str, audio_path: str) -> tuple[bytes, str] | None:
-    """Avatar falante: EchoMimic anima a imagem com o áudio (lip-sync)."""
-    try:
-        from gradio_client import Client, handle_file
-    except ImportError:
-        return None
-    tok = _hf_token_from_env()
-    client = Client("fffiloni/EchoMimic", token=tok, verbose=False)
-    result = client.predict(
-        uploaded_img=handle_file(image_path),
-        uploaded_audio=handle_file(audio_path),
-        width=512, height=512, length=1200, seed=420,
-        facemask_dilation_ratio=0.1, facecrop_dilation_ratio=0.5,
-        context_frames=12, context_overlap=3, cfg=2.5, steps=30,
-        sample_rate=16000, fps=24, device="cuda",
-        api_name="/generate_video",
-    )
-    video_url = result[0]["video"]["url"] if isinstance(result, tuple) else result["video"]["url"]
-    payload = _download_video_payload(video_url)
-    if not payload:
-        return None
-    return payload, video_url
-
-
-def _google_tts_mp3(text: str, lang: str = "pt") -> bytes | None:
-    """Google TTS (o mesmo do /audio) — para a voz do avatar."""
-    try:
-        resp = httpx.get(
-            "https://translate.google.com/translate_tts",
-            params={"ie": "UTF-8", "q": text[:190], "tl": lang, "client": "tw-ob"},
-            timeout=30,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        resp.raise_for_status()
-        if resp.content[:3] != b"ID3" and resp.content[:2] not in (b"\xff\xf3", b"\xff\xf2"):
-            return None
-        return resp.content
-    except Exception:
-        logger.exception("TTS falhou em /video")
-        return None
-
-
 def _video_quota_msg(exc: Exception) -> str | None:
     """Detecta erro de quota ZeroGPU para mensagem amigável."""
     s = str(exc)
@@ -3432,7 +3388,7 @@ def _video_quota_msg(exc: Exception) -> str | None:
 
 
 async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Gera vídeo: texto→vídeo, imagem→vídeo (responder a uma imagem) ou avatar falante."""
+    """Gera vídeo: texto→vídeo ou imagem→vídeo (responder a uma imagem)."""
     user = update.effective_user
     args = list(context.args or [])
     reply_img = None
@@ -3445,99 +3401,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             logger.exception("Falha ao obter imagem respondida")
     sub = (args[0].lower() if args else "")
-    texto = " ".join(args[1:]) if sub in ("texto", "t", "avatar", "a") and len(args) > 1 else " ".join(args)
-
-    if sub == "avatar" or sub == "a":
-        if not texto:
-            await update.message.reply_text(
-                "Como usar o avatar falante:\n"
-                "· Responde a uma foto com: `/avatar olá a todos!`\n"
-                "· `/avatar [descrição do retrato] frase` — gera o retrato e anima"
-            )
-            return
-        thinking = await update.message.reply_text("🧑‍🎤 A preparar o avatar (retrato + voz + animação)...")
-        img_path = reply_img
-        if not img_path:
-            desc = "professional portrait of a friendly person, natural lighting"
-            try:
-                u = (
-                    "https://image.pollinations.ai/prompt/" + urllib.parse.quote(
-                        f"{desc}, realistic portrait photo, front facing, neutral expression, head and shoulders"
-                    )
-                    + f"?width=512&height=512&nologo=true&model=z-image&seed={random.randint(1, 999999)}"
-                )
-                resp = await _http_get(u, timeout=120)
-                fd, img_path = tempfile.mkstemp(suffix=".jpg")
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(resp.content)
-            except Exception:
-                logger.exception("Falha ao gerar retrato /video avatar")
-                await thinking.edit_text("❌ Não consegui gerar o retrato do avatar. Tenta outra vez.")
-                return
-        audio = _google_tts_mp3(texto)
-        if not audio:
-            await thinking.edit_text("❌ Não consegui gerar a voz do avatar. Tenta outra vez.")
-            return
-        fd, audio_path = tempfile.mkstemp(suffix=".mp3")
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(audio)
-        loop = asyncio.get_running_loop()
-        try:
-            res = await loop.run_in_executor(None, _run_echo_avatar, img_path, audio_path)
-        except Exception as exc:
-            logger.exception("EchoMimic falhou em /video")
-            if _video_quota_msg(exc):
-                # Fallback sem GPU: Ken Burns sobre o retrato + a voz como nota de voz
-                await thinking.edit_text(
-                    "⏳ GPU gratuita esgotada — a gerar versão alternativa: "
-                    "retrato com movimento cinematográfico + a voz separada (CPU)..."
-                )
-                kb = os.path.join(tempfile.gettempdir(), f"neobot_kb_{random.randint(1,999999)}.mp4")
-                sent_any = False
-                if _kenburns_video(img_path, kb, 8):
-                    try:
-                        await update.message.reply_video(
-                            video=open(kb, "rb"),
-                            caption=f"🗣 Avatar (modo CPU)\n💬 {html.escape(texto[:150])}",
-                            parse_mode=ParseMode.HTML,
-                        )
-                        sent_any = True
-                    except Exception:
-                        logger.exception("Falha ao enviar Ken Burns avatar")
-                try:
-                    await update.message.reply_voice(voice=audio, caption=f"🎙 {html.escape(texto[:120])}")
-                    sent_any = True
-                except Exception:
-                    logger.exception("Falha ao enviar voz avatar")
-                try:
-                    os.remove(kb)
-                except OSError:
-                    pass
-                if sent_any:
-                    await thinking.delete()
-                    return
-                await thinking.edit_text("❌ Não consegui gerar a versão alternativa agora. Tenta mais tarde.")
-                return
-            await thinking.edit_text("❌ A animação do avatar falhou agora. Tenta outra vez em instantes.")
-            return
-        finally:
-            for tmp in (audio_path,):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        if not res:
-            await thinking.edit_text("❌ A animação do avatar falhou agora. Tenta outra vez em instantes.")
-            return
-        payload, url = res
-        caption = f"🗣 Avatar falante\n💬 {html.escape(texto[:150])}"
-        try:
-            await update.message.reply_video(video=payload, caption=caption, parse_mode=ParseMode.HTML)
-            await thinking.delete()
-        except Exception:
-            logger.exception("Falha ao enviar avatar")
-            await thinking.edit_text(f"🎬 O avatar foi gerado mas excede o limite do Telegram. Vê aqui:\n{url}")
-        return
+    texto = " ".join(args[1:]) if sub in ("texto", "t") and len(args) > 1 else " ".join(args)
 
     # --- texto→vídeo / imagem→vídeo (LTX) ---
     if not texto:
@@ -3545,7 +3409,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Como usar:\n"
             "· `/video <descrição>` — gera vídeo a partir de texto\n"
             "· Responde a uma imagem com `/video faz-la mover-se` — anima a imagem\n"
-            "· `/avatar <frase>` — avatar falante (responde a uma foto ou descreve o retrato)"
+            "· `/video <descrição>` com um URL de imagem — anima essa imagem"
         )
         return
     if user and _rate_limited(user.id):
@@ -3745,30 +3609,33 @@ async def cmd_radio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --- /streamhub (hub de sites de streaming: filmes, séries e canais IPTV) ---
 
 STREAMHUB_HUBS = [
-    ("NetFly", "https://netflyapp.com/pt"),
-    ("Lokke", "https://lokke.app/download"),
     ("FMHY — a maior lista de streaming", "https://fmhy.net/video"),
+    ("ClipBox", "https://clipbox.mov/"),
+    ("RBTV", "https://rbtv.pro/"),
+    ("NetFly", "https://netflyapp.com/pt"),
+    ("Lokke (huhu.to)", "https://lokke.app/download"),
+    ("Cyfer — app de streaming (releases)", "https://github.com/FortunasXP/Cyfer-Streaming-Releases/releases"),
 ]
 
 STREAMHUB_FILMES = [
-    ("MegaFlix", "https://megaflix.store/"),
-    ("MegaTuga", "https://megatuga.io/"),
+    ("OnlyFlix", "https://onlyflix.to/"),
+    ("MegaTuga", "https://www.megatuga.site/"),
     ("StreamGoblin", "https://streamgoblin.com/"),
-    ("Cinegram", "https://cinegram.net/"),
+    ("Cinegram", "https://cinegram.tv/home/"),
     ("WarezTuga", "https://wareztuga.io/"),
     ("Tugaflix", "https://tugaflix.site/"),
     ("TugaStream", "https://tugastream.top/"),
     ("Mirana TV", "https://mirana.tv/"),
-    ("VisionCine", "https://visioncine.stream/"),
-    ("FMovies", "https://www.fmovies.gd/"),
-    ("Cineby", "https://www.cineby.gd/"),
-    ("BrocoFlix", "https://brocoflix.xyz/"),
-    ("BitCine", "https://www.bitcine.app/"),
-    ("CineHD", "https://cinehd.cc/"),
-    ("TopFilmeOnline", "https://topfilmeonline.org/"),
+    ("Cineby", "https://cineby.win/"),
+    ("FMovies", "https://www.f-movies.org/"),
+    ("Cineby WS", "https://cineby.ws/"),
+    ("BrocoFlix", "https://livezy.click/brocoflix/"),
+    ("BitCine", "https://bitcine.one/"),
+    ("CineHD", "https://cinehd.vc/"),
+    ("FilminCuk", "https://filmincuk.org/"),
     ("StreamIMDB", "https://streamimdb.ru/"),
-    ("Encontrei", "https://encontrei.info/"),
-    ("Overflix", "https://www.overflix.tires/"),
+    ("Encontrei", "https://encontrei.me/"),
+    ("Overflix", "https://www.overflix.beauty/"),
     ("Vizer", "https://www.vizer.men"),
     ("PobreflixTV", "https://www.pobreflixtv.locker"),
     ("PixelFlix", "https://pixelflix.cc/"),
@@ -3779,15 +3646,21 @@ STREAMHUB_IPTV = [
     ("SportsOnline — programação (vc)", "https://sportsonline.vc/prog.txt"),
     ("SportsOnline — programação (pk)", "https://sportsonline.pk/prog.txt"),
     ("SportsOnline — programação (cx)", "https://sportsonline.cx/prog.txt"),
+    ("RBTV77", "https://rbtv77.com.co/"),
     ("IPTV Web", "https://iptv-web.app/#PH"),
     ("Worlds TV Mobile — desporto", "https://worldstvmobile.com/category/sports"),
-    ("Rebel Pirate TV", "https://rebel-pirate-tv.vercel.app/"),
+    ("FCTV33", "https://fctv33.vip/download/"),
+    ("Canais TV (HF Space) ⭐", "https://huggingface.co/spaces/ptlegion/canais-tv"),
     ("NEO IPTV ⭐", "https://ptlegion.itch.io/neo-iptv"),
+    ("NeoStreams", "https://neostreams.pages.dev/"),
 ]
 
 STREAMHUB_BTV = [
     ("BTV ao vivo", "https://sportzonline.click/channels/pt/btv.php"),
 ]
+
+# Fonte da lista (pastebin mantido pelo fr33w0rld) — usada nas atualizações
+STREAMHUB_FONTE = "https://pastebin.com/W78Lk6nb"
 
 
 def _streamhub_sec(titulo: str, sites: list[tuple[str, str]]) -> list[str]:
@@ -3826,7 +3699,7 @@ async def cmd_streamhub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "· <code>/streamhub iptv</code> — canais IPTV\n"
             "· <code>/streamhub btv</code> — canal BTV"
         )
-    texto += "\n\n📡 Free Knowledge is the most Powerful Weapon 💻"
+    texto += f"\n🔗 Fonte/updates: {STREAMHUB_FONTE}\n\n📡 Free Knowledge is the most Powerful Weapon 💻"
     await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
