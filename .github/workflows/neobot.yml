@@ -9,7 +9,7 @@ name: NEOBOT 24/7
 on:
   push:
     branches: [main]
-    paths: ["bot.py", "iptv.py", "rebel.m3u"]
+    paths: ["bot.py", "iptv.py", "rebel.m3u", ".github/workflows/neobot.yml"]
   workflow_dispatch:
   schedule:
     - cron: "25 */5 * * *"   # a cada 5h25 (desfasado para evitar picos :00)
@@ -39,6 +39,13 @@ jobs:
           deno --version || true
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # --- OpenCode CLI (para /opencode) ---
+          npm install -g opencode-ai >/dev/null 2>&1 || \
+            curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1 || true
+          opencode --version || echo "OPENCODE_INDISPONIVEL"
+          mkdir -p ~/.config/opencode
+          printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "model": "opencode/muse-spark-1.3-contributor-free"\n}\n' > ~/.config/opencode/opencode.jsonc
+          cat ~/.config/opencode/opencode.jsonc
 
       - name: Teste do motor Seal (diagnostico)
         continue-on-error: true
@@ -53,4 +60,5 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}   # quota ZeroGPU do /music (ACE-Step)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # Lyria (/music) + Veo (/video)
           NEOBOT_HF_TOKENS: ${{ secrets.NEOBOT_HF_TOKENS }}   # tokens HF extra (rotação de quota ZeroGPU)
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}   # /opencode (modelo free do OpenCode)
         run: python -X utf8 bot.py

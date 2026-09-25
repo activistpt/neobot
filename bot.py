@@ -220,9 +220,12 @@ def teclado_menu():
         "▪️ /radio — rádios portuguesas + rádio parceira HellGate 🌟\n"
         "▪️ /music — gera uma música original com a tua descrição 🎼 (ex: `/music balada sobre Coimbra`)\n"
         "▪️ /streamhub — sites de streaming: filmes, séries e IPTV 📺 (ex: `/streamhub filmes`)\n"
+        "▪️ /capcut — alternativas grátis ao CapCut 💻 (ex: `/capcut pc`)\n"
         "▪️ /iptv — IPTV mundial por página web: categorias 📡 (ex: `/iptv web`)\n"
         "▪️ /canal — procura canais IPTV 📺 (ex: `/canal sport tv`)\n"
         "▪️ /video — gera vídeo a partir de texto ou anima uma imagem 🎬 (ex: `/video um dragão a voar`)\n"
+        "▪️ /opencode — executa uma tarefa de código via OpenCode local 🤖 (ex: `/opencode lista os ficheiros`)\n"
+        "▪️ /opencode_status — estado da sessão OpenCode interativa\n"
         "▪️ /avatar — avatar falante: responde a uma foto com `/avatar olá!` 🗣\n"
         "▪️ /ajuda — mostra esta mensagem\n\n"
         "Escolhe um botão abaixo ou escreve um comando! 👇"
@@ -1080,6 +1083,188 @@ async def cmd_webcams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception:
         await update.message.reply_text(texto)
+
+# --- /opencode (OpenCode local: tarefas de código via Telegram) ---
+
+_OPENCODE_TIMEOUT = 300  # 5 min por tarefa one-shot
+
+# Sessões interativas em memória: user_id -> {"session_id", "time", "prompts"}
+# (a continuidade real fica a cargo do OpenCode: cada continuar corre `run --continue`)
+_opencode_sessoes: dict[int, dict] = {}
+
+
+def _opencode_bin() -> str | None:
+    """Encontra o binário do OpenCode instalado (None se não existir)."""
+    try:
+        import shutil
+
+        return shutil.which("opencode")
+    except Exception:
+        return None
+
+
+def _opencode_run_sync(bin_path: str, prompt: str, cwd: str, timeout: int, continuar: bool = False) -> tuple[int, str, str]:
+    """Corre `opencode run <prompt>` (bloqueante — chamar via asyncio.to_thread).
+
+    stdin tem de ficar fechado (DEVNULL): sem TTY o CLI fica à espera.
+    continuar=True usa `--continue` para seguir a sessão interativa.
+    """
+    import subprocess as sp
+
+    cmd = [bin_path, "run"] + (["--continue"] if continuar else []) + [prompt]
+    proc = sp.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        stdin=sp.DEVNULL,
+    )
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _fmt_opencode_out(texto: str, limite: int = 3500) -> str:
+    texto = (texto or "").strip() or "(sem saída)"
+    # Remove o banner do CLI ("> build · modelo") e linhas vazias iniciais
+    while texto and (texto.startswith(">") or texto.startswith("\n")):
+        texto = texto[1:] if texto.startswith("\n") else texto[texto.find("\n") + 1 :]
+        texto = texto.lstrip("\n")
+    texto = texto.strip() or "(sem saída)"
+    if len(texto) > limite:
+        texto = texto[: limite - 3] + "..."
+    return texto
+
+
+async def cmd_opencode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Corre uma tarefa única via OpenCode local."""
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text(
+            "🤖 *OpenCode — Modo Rápido*\n\n"
+            "Usa: `/opencode <tarefa>`\n\n"
+            "Exemplos:\n"
+            "• `/opencode lista os ficheiros deste projeto`\n"
+            "• `/opencode adiciona testes ao módulo x`\n\n"
+            "Sessão interativa: /opencode_iniciar + /opencode_continuar",
+            parse_mode="Markdown",
+        )
+        return
+    bin_path = _opencode_bin()
+    if not bin_path:
+        await update.message.reply_text(
+            "⚠️ O *OpenCode* não está instalado neste ambiente.\n"
+            "Instala-o (ex: `npm i -g opencode-ai`) e tenta outra vez."
+        )
+        return
+    thinking = await update.message.reply_text("⚡ A executar via OpenCode...")
+    try:
+        rc, out, err = await asyncio.to_thread(
+            _opencode_run_sync, bin_path, prompt, os.getcwd(), _OPENCODE_TIMEOUT
+        )
+    except Exception as e:
+        await thinking.edit_text(f"💥 Erro: {html.escape(str(e))}")
+        return
+    if rc == 0:
+        texto = f"✅ *Resultado:*\n{_fmt_opencode_out(out)}"
+    else:
+        texto = f"❌ *Erro:*\n{_fmt_opencode_out(err or out)}"
+    try:
+        await thinking.edit_text(texto, parse_mode=ParseMode.HTML)
+    except Exception:
+        await thinking.edit_text(texto)
+
+
+async def cmd_opencode_iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Marca o início de uma sessão OpenCode contínua (uma por utilizador)."""
+    user_id = update.effective_user.id
+    if not _opencode_bin():
+        await update.message.reply_text(
+            "⚠️ O *OpenCode* não está instalado neste ambiente.\n"
+            "Instala-o (ex: `bun install -g opencode-ai`) e tenta outra vez."
+        )
+        return
+    _opencode_sessoes.pop(user_id, None)
+    session_id = f"tg_{int(time.time())}_{random.randrange(16 ** 8):08x}"
+    _opencode_sessoes[user_id] = {"session_id": session_id, "time": time.time(), "prompts": 0}
+    await update.message.reply_text(
+        f"🔄 *Sessão OpenCode iniciada:* `{session_id}`\n\n"
+        "Envia tarefas com /opencode_continuar <prompt>\n"
+        "Estado: /opencode_status",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_opencode_continuar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Continua a sessão OpenCode do utilizador (`opencode run --continue`)."""
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text(
+            "📝 Formato: `/opencode_continuar <prompt>`\n"
+            "Exemplo: `/opencode_continuar agora adiciona testes`",
+            parse_mode="Markdown",
+        )
+        return
+    user_id = update.effective_user.id
+    sessao = _opencode_sessoes.get(user_id)
+    if not sessao:
+        await update.message.reply_text(
+            "📋 *Sem sessões ativas.*\nUsa /opencode_iniciar para começar.",
+            parse_mode="Markdown",
+        )
+        return
+    bin_path = _opencode_bin()
+    if not bin_path:
+        await update.message.reply_text("⚠️ O *OpenCode* não está instalado neste ambiente.")
+        return
+    thinking = await update.message.reply_text("⚡ A continuar a sessão via OpenCode...")
+    try:
+        rc, out, err = await asyncio.wait_for(
+            asyncio.to_thread(
+                _opencode_run_sync, bin_path, prompt, os.getcwd(), _OPENCODE_TIMEOUT, True
+            ),
+            timeout=_OPENCODE_TIMEOUT + 30,
+        )
+    except asyncio.TimeoutError:
+        await thinking.edit_text(
+            "⏱ A tarefa excedeu o tempo limite (5 min). Tenta /opencode para tarefas rápidas."
+        )
+        return
+    except Exception as e:
+        await thinking.edit_text(f"💥 Erro: {html.escape(str(e))}")
+        return
+    sessao["prompts"] = sessao.get("prompts", 0) + 1
+    sessao["time"] = time.time()
+    if rc == 0:
+        texto = f"✅ *Resultado ({sessao['prompts']}º da sessão):*\n{_fmt_opencode_out(out)}"
+    else:
+        texto = f"❌ *Erro:*\n{_fmt_opencode_out(err or out)}"
+    try:
+        await thinking.edit_text(texto, parse_mode=ParseMode.HTML)
+    except Exception:
+        await thinking.edit_text(texto)
+
+
+async def cmd_opencode_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mostra o estado da sessão OpenCode do utilizador."""
+    sessao = _opencode_sessoes.get(update.effective_user.id)
+    if not sessao:
+        await update.message.reply_text(
+            "📊 *OpenCode — Sem sessões ativas*\n\n"
+            "🚀 Modos disponíveis:\n"
+            "• /opencode <tarefa> — rápido (one-shot)\n"
+            "• /opencode_iniciar + /opencode_continuar — interativo",
+            parse_mode="Markdown",
+        )
+        return
+    tempo = int(time.time() - sessao["time"])
+    await update.message.reply_text(
+        f"📊 *Sessão:* `{sessao['session_id']}`\n"
+        f"⏱ Última atividade: {tempo // 60}m {tempo % 60}s atrás\n"
+        f"📨 Prompts na sessão: {sessao.get('prompts', 0)}\n"
+        "Estado: 🟢 ATIVA (termina se o bot reiniciar)",
+        parse_mode="Markdown",
+    )
+
 
 async def _list_web_results(query: str, limit: int) -> list[tuple[str, str, str]]:
     try:
@@ -3195,6 +3380,51 @@ async def cmd_streamhub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+# --- /capcut (alternativas opensource ao CapCut) ---
+
+CAPCUT_OSS = [
+    ("Shotcut ⭐ — editor completo, sem marca de água", "https://shotcut.org/download/"),
+    ("Kdenlive — profissional, efeitos avançados", "https://kdenlive.org/download/"),
+    ("OpenShot — simples e leve, ideal para começar", "https://www.openshot.org/download/"),
+    ("Olive — editor não-linear moderno", "https://olivevideoeditor.org/download.php"),
+    ("Blender VSE — suíte 3D com editor de vídeo", "https://www.blender.org/download/"),
+    ("Avidemux — cortes e conversões rápidas", "https://avidemux.sourceforge.net/download.html"),
+    ("CapWeb — clone web do CapCut (abre no browser)", "https://imgly.github.io/capcut-clone/"),
+]
+
+CAPCUT_WEB = [
+    ("Canva Video — templates + IA", "https://www.canva.com/features/video-editor/"),
+    ("InVideo — criação com IA", "https://invideo.io/"),
+    ("Animoto — vídeos profissionais rápidos", "https://animoto.com/online-video-maker"),
+    ("Magisto — edição inteligente automática", "https://www.magisto.com/"),
+    ("Desygner — editor gratuito online", "https://www.desygner.com/"),
+]
+
+
+async def cmd_capcut(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alternativas opensource e web ao CapCut, com downloads diretos."""
+    cat = " ".join(context.args).strip().lower() if context.args else ""
+    texto = "🎬 <b>NEOBOT CapCut Alternatives</b> — Substitui o CapCut grátis\n"
+    if cat in ("", "tudo", "all"):
+        texto += "".join(
+            _streamhub_sec("💻 OpenSource — instala no PC (Windows/Mac/Linux)", CAPCUT_OSS)
+            + _streamhub_sec("🌐 Web / IA — direto no browser", CAPCUT_WEB)
+        )
+    elif cat.startswith("pc") or cat.startswith("desk") or "open" in cat or "os" == cat:
+        texto += "".join(_streamhub_sec("💻 OpenSource — downloads diretos", CAPCUT_OSS))
+    elif "ia" in cat or "web" in cat or "online" in cat:
+        texto += "".join(_streamhub_sec("🌐 Web / IA — direto no browser", CAPCUT_WEB))
+    else:
+        texto += (
+            "\nCategoria não reconhecida. Usa:\n"
+            "· <code>/capcut</code> — lista completa\n"
+            "· <code>/capcut pc</code> — apps opensource para instalar\n"
+            "· <code>/capcut ia</code> — editores web/IA no browser"
+        )
+    texto += "\n\n✅ Todas as opções opensource são 100% gratuitas e sem marca de água."
+    await update.message.reply_text(texto, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
 # --- /iptv e /canal (fontes por página web: Rebel + SportOnline + TV Garden) ---
 
 try:  # corre como script (py bot.py) ou como módulo
@@ -3475,7 +3705,9 @@ async def _post_init(app: Application) -> None:
                 BotCommand("mp3", "Extrair áudio de um link"),
                 BotCommand("radio", "Rádios portuguesas"),
                 BotCommand("streamhub", "Sites de streaming"),
+                BotCommand("capcut", "Alternativas ao CapCut 🎬"),
                 BotCommand("hora", "Que horas são"),
+                BotCommand("opencode", "OpenCode: tarefa de código 🤖"),
             ]
         )
     except Exception:
@@ -3535,9 +3767,19 @@ def main() -> None:
     app.add_handler(CommandHandler("music", cmd_music))
     app.add_handler(CommandHandler("video", cmd_video))
     app.add_handler(CommandHandler("streamhub", cmd_streamhub))
+    app.add_handler(CommandHandler("capcut", cmd_capcut))
     app.add_handler(CommandHandler("iptv", cmd_iptv))
     app.add_handler(CommandHandler("canal", cmd_canal))
     app.add_handler(CommandHandler("webcams", cmd_webcams))
+    app.add_handler(CommandHandler("opencode", cmd_opencode))
+    app.add_handler(CommandHandler("opencode_iniciar", cmd_opencode_iniciar))
+    app.add_handler(CommandHandler("opencode_continuar", cmd_opencode_continuar))
+    app.add_handler(CommandHandler("opencode_status", cmd_opencode_status))
+    # Aliases curtos (o Telegram não aceita '-' em comandos)
+    app.add_handler(CommandHandler("oc", cmd_opencode))
+    app.add_handler(CommandHandler("oci", cmd_opencode_iniciar))
+    app.add_handler(CommandHandler("occ", cmd_opencode_continuar))
+    app.add_handler(CommandHandler("ocs", cmd_opencode_status))
 
     # Responde quando alguém escreve 'neobot' numa mensagem de grupo (sem slash)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, neobot_mention))
