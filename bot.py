@@ -208,8 +208,7 @@ def teclado_menu():
         "▪️ /image — gera uma imagem (ex: `/image gato astronauta`)\n"
         "▪️ /audio — pergunta qualquer coisa: pesquiso na web e respondo em voz 🎙 (ex: `/audio notícias de hoje`)\n"
         "▪️ /voz — clipe de voz em português de Portugal 🇵🇹 (ex: `/voz boa noite` ou `/voz raquel olá!`)\n"
-        "▪️ /ouvir — envia um clip de voz e ele responde com texto + IA 🎙 (ou responde a um voice com `/ouvir`)\n"
-        "▪️ /falar — o mesmo, mas a resposta chega em voz pt-PT (ex: responde a um voice com `/falar raquel`)\n"
+        "▪️ Nota de voz — envia um clip de voz e respondo em áudio 🎙 (fala à vontade!)\n"
         "▪️ /meteo — meteorologia (ex: `/meteo Lisboa`)\n"
         "▪️ /youtube — pesquisa no YouTube (ex: `/youtube tutorial python`)\n"
         "▪️ /crypto — preços de crypto (ex: `/crypto btc`)\n"
@@ -963,9 +962,40 @@ def _audio_content_type(nome: str) -> str:
 
 
 async def _transcrever_audio(dados: bytes, nome: str) -> str:
-    """Transcreve áudio: Whisper na Groq primeiro; fallback Hugging Face
-    (a Cloudflare da Groq bloqueia às vezes os IPs de datacenter como os do Actions)."""
+    """Transcreve áudio em cascata: Space openai/whisper (gradio — o caminho
+    comprovado a funcionar da rede do Actions) -> Groq -> HF router."""
     erros: list[str] = []
+
+    # 1º motor: Space público openai/whisper (gradio, sem quota ZeroGPU)
+    try:
+        def _space_transcribe() -> str:
+            from gradio_client import Client, handle_file
+
+            ext = os.path.splitext(nome)[1] or ".ogg"
+            tmp = os.path.join(tempfile.gettempdir(), f"whisper_in_{os.getpid()}{ext}")
+            with open(tmp, "wb") as fh:
+                fh.write(dados)
+            try:
+                cliente = Client("openai/whisper")
+                resultado = cliente.predict(inputs=handle_file(tmp))
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            if isinstance(resultado, (list, tuple)) and resultado:
+                resultado = resultado[0]
+            return str(resultado).strip()
+
+        texto = await asyncio.to_thread(_space_transcribe)
+        if texto:
+            return texto
+        erros.append("Space openai/whisper: resposta vazia")
+    except Exception as e:
+        erros.append(f"Space: {e}")
+        logger.warning("Whisper Space falhou: %s", str(e)[:140])
+
+    # 2º motor: Groq (rápido quando a Cloudflare deixa passar)
     if _groq_key():
         try:
             headers = {"Authorization": f"Bearer {_groq_key()}", "User-Agent": GROQ_HEADERS["User-Agent"]}
@@ -1004,33 +1034,6 @@ async def _transcrever_audio(dados: bytes, nome: str) -> str:
         except Exception as e:
             erros.append(f"HF: {e}")
             logger.warning("Whisper HF falhou: %s", str(e)[:140])
-    # 3º motor: Space público openai/whisper (gradio, sem quota ZeroGPU)
-    try:
-        def _space_transcribe() -> str:
-            from gradio_client import Client, handle_file
-
-            tmp = os.path.join(tempfile.gettempdir(), f"whisper_in_{os.getpid()}" + os.path.splitext(nome)[1] or ".ogg")
-            with open(tmp, "wb") as fh:
-                fh.write(dados)
-            try:
-                cliente = Client("openai/whisper")
-                resultado = cliente.predict(inputs=handle_file(tmp))
-            finally:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-            if isinstance(resultado, (list, tuple)) and resultado:
-                resultado = resultado[0]
-            return str(resultado).strip()
-
-        texto = await asyncio.to_thread(_space_transcribe)
-        if texto:
-            return texto
-        erros.append("Space openai/whisper: resposta vazia")
-    except Exception as e:
-        erros.append(f"Space: {e}")
-        logger.warning("Whisper Space falhou: %s", str(e)[:140])
     raise RuntimeError("; ".join(erros) or "nenhum motor de transcrição disponível")
 
 
@@ -1048,9 +1051,8 @@ async def _processar_voz(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
     media = alvo.voice or alvo.audio
     if not media:
         await msg.reply_text(
-            "🎙 Envia um clip de voz (ou responde a um com este comando).\n"
-            "• /ouvir — responde com texto + IA\n"
-            "• /falar — responde com voz pt-PT"
+            "🎙 Envia uma nota de voz e respondo em áudio.\n"
+            "Para perguntas por texto, usa /audio <pergunta>."
         )
         return
     if media.file_size and media.file_size > _VOZ_AI_MAX_MB * 1024 * 1024:
@@ -1066,11 +1068,11 @@ async def _processar_voz(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
         return
     try:
         texto = await asyncio.wait_for(
-            _transcrever_audio(dados, media.file_name or "voz.ogg"), timeout=180
+            _transcrever_audio(dados, media.file_name or "voz.ogg"), timeout=240
         )
     except Exception:
         logger.exception("Falha na transcrição Whisper")
-        await thinking.edit_text("❌ Não consegui transcrever o áudio agora (os dois motores falharam). Tenta outra vez.")
+        await thinking.edit_text("❌ Não consegui transcrever o áudio agora. Tenta outra vez.")
         return
     if not texto:
         await thinking.edit_text("🤔 Não percebi nada no áudio (silêncio?).")
@@ -1135,16 +1137,9 @@ async def _processar_voz(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
         await thinking.edit_text(corpo)
 
 
-async def cmd_ouvir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lê um clip de voz e responde com a transcrição + resposta da IA (texto)."""
-    voz_pedida = context.args[0].lower() if context.args and context.args[0].lower() in _VOZES_PT else None
-    await _processar_voz(update, context, "transcrever", voz_pedida)
-
-
-async def cmd_falar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lê um clip de voz e responde com voz pt-PT (Duarte por omissão, Raquel opcional)."""
-    voz_pedida = context.args[0].lower() if context.args and context.args[0].lower() in _VOZES_PT else None
-    await _processar_voz(update, context, "falar", voz_pedida)
+async def ao_receber_voz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nota de voz/áudio recebida sem comando: transcreve e responde em voz pt-PT."""
+    await _processar_voz(update, context, "falar", None)
 
 
 # --- /meteo (Open-Meteo) ---
@@ -4076,7 +4071,6 @@ async def _post_init(app: Application) -> None:
                 BotCommand("streamhub", "Sites de streaming"),
                 BotCommand("capcut", "Alternativas ao CapCut 🎬"),
                 BotCommand("voz", "Voz pt-PT: lê o teu texto 🎙"),
-                BotCommand("ouvir", "Envia voz: responde com IA 🎙"),
                 BotCommand("audio", "Pergunta e ouve a resposta 🎙"),
                 BotCommand("hora", "Que horas são"),
                 BotCommand("opencode", "OpenCode: tarefa de código 🤖"),
@@ -4141,10 +4135,8 @@ def main() -> None:
     app.add_handler(CommandHandler("streamhub", cmd_streamhub))
     app.add_handler(CommandHandler("capcut", cmd_capcut))
     app.add_handler(CommandHandler("voz", cmd_voz))
-    app.add_handler(CommandHandler("ouvir", cmd_ouvir))
-    app.add_handler(CommandHandler("falar", cmd_falar))
-    # Clip de voz/áudio sem comando: transcreve + responde por texto (igual ao /ouvir)
-    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, cmd_ouvir))
+    # Nota de voz/áudio recebida (sem comando): transcreve e responde em voz pt-PT
+    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, ao_receber_voz))
     app.add_handler(CommandHandler("iptv", cmd_iptv))
     app.add_handler(CommandHandler("canal", cmd_canal))
     app.add_handler(CommandHandler("webcams", cmd_webcams))
