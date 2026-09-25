@@ -1,6 +1,6 @@
 """
 NEOBOT — Assistente multiusos para Telegram
-Comandos: /start, /ajuda, /hora, /data, /piada, /dado, /moeda, /escolhe, /ask, /google, /news
+Comandos: /start, /ajuda, /piada, /ask, /google, /news e muitos mais (ver /ajuda)
 """
 
 import asyncio
@@ -195,12 +195,7 @@ def teclado_menu():
     return (
         "🤖 *NEOBOT* — o teu assistente!\n\n"
         "Comandos disponíveis:\n"
-        "▪️ /hora — que horas são\n"
-        "▪️ /data — que dia é hoje\n"
         "▪️ /piada — piadas filosóficas, de informática e de hackers 🏴‍☠️\n"
-        "▪️ /dado — lança um dado (1-6)\n"
-        "▪️ /moeda — cara ou coroa\n"
-        "▪️ /escolhe — escolhe por ti (ex: `/escolhe pizza sushi burger`)\n"
         "▪️ /ask — pergunta algo à IA (ex: `/ask quem escreveu Dom Casmurro?`)\n"
         "▪️ /google — pesquisa na internet (ex: `/google últimas notícias do GPL`)\n"
         "▪️ /news — notícias da atualidade (ex: `/news tecnologia`)\n"
@@ -275,44 +270,18 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(teclado_menu())
 
 
-async def cmd_hora(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    agora = datetime.now()
-    await update.message.reply_text(f"🕐 Agora são *{agora.strftime('%H:%M:%S')}*", parse_mode="Markdown")
 
 
-async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    dias = ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado", "Domingo"]
-    meses = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
-             "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
-    hoje = datetime.now()
-    texto = f"📅 Hoje é *{dias[hoje.weekday()]}*, {hoje.day} de {meses[hoje.month - 1]} de {hoje.year}"
-    await update.message.reply_text(texto, parse_mode="Markdown")
 
 
 async def cmd_piada(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(random.choice(PIADAS))
 
 
-async def cmd_dado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    n = random.randint(1, 6)
-    dados = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"]
-    await update.message.reply_text(f"🎲 Lançaste o dado... *{n}*! {dados[n - 1]}", parse_mode="Markdown")
 
 
-async def cmd_moeda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    resultado = random.choice(["Cara 🪙", "Coroa 🌙"])
-    await update.message.reply_text(f"🪙 A moeda caiu... *{resultado}*!", parse_mode="Markdown")
 
 
-async def cmd_escolhe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text(
-            "Dá-me as opções! Exemplo:\n`/escolhe pizza sushi burger`",
-            parse_mode="Markdown",
-        )
-        return
-    escolha = random.choice(context.args)
-    await update.message.reply_text(f"🤔 Eu escolho... *{escolha}*!", parse_mode="Markdown")
 
 
 def _extract_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
@@ -4142,12 +4111,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ajuda", cmd_ajuda))
     app.add_handler(CommandHandler("help", cmd_ajuda))
-    app.add_handler(CommandHandler("hora", cmd_hora))
-    app.add_handler(CommandHandler("data", cmd_data))
     app.add_handler(CommandHandler("piada", cmd_piada))
-    app.add_handler(CommandHandler("dado", cmd_dado))
-    app.add_handler(CommandHandler("moeda", cmd_moeda))
-    app.add_handler(CommandHandler("escolhe", cmd_escolhe))
     app.add_handler(CommandHandler("google", cmd_google))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("news", cmd_news))
