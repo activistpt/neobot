@@ -421,10 +421,10 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     author = user.first_name if user else "Alguém"
 
-    if not _groq_key():
+    if not _groq_key() and not _opencode_bin():
         await update.message.reply_text(
             "🧠 A minha IA ainda não está configurada — o admin precisa de adicionar "
-            "`GROQ_API_KEY` ao .env. Volta em breve!",
+            "`GROQ_API_KEY` ou instalar o OpenCode. Volta em breve!",
             parse_mode="Markdown",
         )
         return
@@ -444,34 +444,61 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    thinking = await update.message.reply_text("🧠 A pensar...")
+    thinking = await update.message.reply_text("🧠 A pensar (com pesquisa web)...")
+
+    # Pesquisa web primeiro (mesmo motor do /google) para dados atuais
+    fonte = ""
+    contexto_web = ""
     try:
-        answer = await _groq_chat(
-            GROQ_MODEL,
-            GROQ_SYSTEM_PROMPT,
-            f"{author} pergunta: {question}",
-        )
-    except httpx.HTTPStatusError as exc:
-        logger.warning("Groq HTTP %s: %s", exc.response.status_code, exc.response.text[:200])
-        await thinking.edit_text(
-            "😅 A IA está sobrecarregada ou indisponível neste momento. Tenta outra vez daqui a pouco."
-        )
-        return
+        resultados = await _ddg_search(question, limit=5)
     except Exception:
-        logger.exception("Falha ao contactar a Groq")
-        await thinking.edit_text("❌ Não consegui falar com a IA agora. Tenta outra vez em instantes.")
-        return
+        logger.exception("Pesquisa falhou no /ask")
+        resultados = []
+    if resultados:
+        contexto_web = "\n".join(
+            f"[{i + 1}] {t} — {s} (fonte: {u})" for i, (t, u, s) in enumerate(resultados)
+        )
+        fonte = urllib.parse.urlparse(resultados[0][1]).netloc or ""
+
+    # Motor principal: IA do OpenCode (muse-spark free); fallback: Groq
+    cerebro = "OpenCode"
+    try:
+        resposta = await _opencode_ask(question, contexto_web)
+    except Exception:
+        logger.warning("OpenCode falhou no /ask — tento Groq", exc_info=True)
+        cerebro = "Groq"
+        if not _groq_key():
+            await thinking.edit_text(
+                "❌ Nenhuma IA disponível agora (OpenCode indisponível e sem GROQ_API_KEY)."
+            )
+            return
+        try:
+            user_content = f"{author} pergunta: {question}"
+            if contexto_web:
+                user_content += f"\n\nContexto web:\n{contexto_web}"
+            resposta = await _groq_chat(GROQ_MODEL, GROQ_SYSTEM_PROMPT, user_content)
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Groq HTTP %s: %s", exc.response.status_code, exc.response.text[:200])
+            await thinking.edit_text(
+                "😅 A IA está sobrecarregada ou indisponível neste momento. Tenta outra vez daqui a pouco."
+            )
+            return
+        except Exception:
+            logger.exception("Falha ao contactar a Groq")
+            await thinking.edit_text("❌ Nenhuma IA respondeu agora. Tenta outra vez em instantes.")
+            return
 
     # Strip any markup the model leaks, then escape for Telegram HTML.
-    answer = _strip_markup(answer)
+    answer = _strip_markup(resposta)
     # Telegram HTML messages cap at 4096 chars.
     if len(answer) > 4000:
         answer = answer[:3990] + "…"
+    rodape = f"\n\n🧠 {cerebro}" + (f" · 🔗 {fonte}" if fonte else "")
     header = f"💬 *{author}* perguntou:\n❝{question[:180]}❞\n\n"
     try:
-        await thinking.edit_text(header + answer, parse_mode=ParseMode.HTML)
+        await thinking.edit_text(header + answer + rodape, parse_mode=ParseMode.HTML)
     except Exception:
-        await thinking.edit_text(f"💬 {author} perguntou:\n❝{question[:180]}❞\n\n{answer}")
+        await thinking.edit_text(f"💬 {author} perguntou:\n❝{question[:180]}❞\n\n{answer}{rodape}")
 
 
 # --- /news: recent news by category ---
@@ -1506,6 +1533,34 @@ def _fmt_opencode_out(texto: str, limite: int = 3500) -> str:
     texto = texto.strip() or "(sem saída)"
     if len(texto) > limite:
         texto = texto[: limite - 3] + "..."
+    return texto
+
+
+async def _opencode_ask(pergunta: str, contexto_web: str = "") -> str:
+    """Pergunta à IA do OpenCode local (modelo configurado no opencode.jsonc,
+    atualmente muse-spark free via OpenRouter). Opcionalmente recebe resultados
+    de pesquisa web para responder com dados atuais."""
+    bin_path = _opencode_bin()
+    if not bin_path:
+        raise RuntimeError("OpenCode não instalado neste ambiente")
+    prompt = (
+        "Responde em português de Portugal, conciso (máx. 120 palavras), texto simples "
+        "sem markdown nem URLs. Se houver RESULTADOS DA PESQUISA WEB abaixo, usa-os "
+        "para responder e menciona a fonte principal entre parênteses. "
+        "Se os resultados forem irrelevantes, responde do teu conhecimento.\n\n"
+        "PERGUNTA: " + pergunta
+    )
+    if contexto_web:
+        prompt += "\n\nRESULTADOS DA PESQUISA WEB:\n" + contexto_web
+    rc, out, err = await asyncio.wait_for(
+        asyncio.to_thread(_opencode_run_sync, bin_path, prompt, os.getcwd(), 150, False),
+        timeout=170,
+    )
+    if rc != 0:
+        raise RuntimeError((err or out or "erro desconhecido")[:200])
+    texto = _fmt_opencode_out(out, limite=3900)
+    if not texto or texto == "(sem saída)":
+        raise RuntimeError("OpenCode respondeu vazio")
     return texto
 
 
