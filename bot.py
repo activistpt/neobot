@@ -920,22 +920,67 @@ async def cmd_voz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --- /ouvir e /falar: le clips de voz (Whisper na Groq) e responde por texto ou voz pt-PT ---
 
 _WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+_HF_WHISPER_URL = "https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3-turbo"
 _WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3-turbo")
 _VOZ_AI_MAX_MB = 20
 
 
-async def _groq_transcrever(audio: bytes, nome: str) -> str:
-    """Transcreve áudio com o Whisper (mesma API key Groq do /ask)."""
-    headers = {"Authorization": f"Bearer {_groq_key()}", "User-Agent": GROQ_HEADERS["User-Agent"]}
-    async with httpx.AsyncClient(timeout=90) as client:
-        resp = await client.post(
-            _WHISPER_URL,
-            headers=headers,
-            files={"file": (nome, audio, "application/octet-stream")},
-            data={"model": _WHISPER_MODEL},
-        )
-        resp.raise_for_status()
-        return resp.json().get("text", "").strip()
+def _audio_content_type(nome: str) -> str:
+    nome = (nome or "").lower()
+    if nome.endswith(".ogg") or nome.endswith(".oga"):
+        return "audio/ogg"
+    if nome.endswith(".mp3"):
+        return "audio/mpeg"
+    if nome.endswith(".wav"):
+        return "audio/wav"
+    if nome.endswith(".m4a") or nome.endswith(".mp4"):
+        return "audio/mp4"
+    return "application/octet-stream"
+
+
+async def _transcrever_audio(dados: bytes, nome: str) -> str:
+    """Transcreve áudio: Whisper na Groq primeiro; fallback Hugging Face
+    (a Cloudflare da Groq bloqueia às vezes os IPs de datacenter como os do Actions)."""
+    erros: list[str] = []
+    if _groq_key():
+        try:
+            headers = {"Authorization": f"Bearer {_groq_key()}", "User-Agent": GROQ_HEADERS["User-Agent"]}
+            async with httpx.AsyncClient(timeout=90) as client:
+                resp = await client.post(
+                    _WHISPER_URL,
+                    headers=headers,
+                    files={"file": (nome, dados, _audio_content_type(nome))},
+                    data={"model": _WHISPER_MODEL},
+                )
+                resp.raise_for_status()
+                texto = resp.json().get("text", "").strip()
+                if texto:
+                    return texto
+                erros.append("Groq: resposta vazia")
+        except Exception as e:
+            erros.append(f"Groq: {e}")
+            logger.warning("Whisper Groq falhou (%s) — tento Hugging Face", str(e)[:140])
+    hf = os.environ.get("HF_TOKEN", "").strip()
+    if hf:
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    _HF_WHISPER_URL,
+                    headers={
+                        "Authorization": f"Bearer {hf}",
+                        "Content-Type": _audio_content_type(nome),
+                    },
+                    content=dados,
+                )
+                resp.raise_for_status()
+                texto = (resp.json() or {}).get("text", "").strip()
+                if texto:
+                    return texto
+                erros.append("HF: resposta vazia")
+        except Exception as e:
+            erros.append(f"HF: {e}")
+            logger.warning("Whisper HF falhou: %s", str(e)[:140])
+    raise RuntimeError("; ".join(erros) or "nenhum motor de transcrição disponível")
 
 
 async def _processar_voz(update: Update, context: ContextTypes.DEFAULT_TYPE, modo: str, voz_pedida: str | None) -> None:
@@ -970,11 +1015,11 @@ async def _processar_voz(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
         return
     try:
         texto = await asyncio.wait_for(
-            _groq_transcrever(dados, media.file_name or "voz.ogg"), timeout=120
+            _transcrever_audio(dados, media.file_name or "voz.ogg"), timeout=180
         )
     except Exception:
         logger.exception("Falha na transcrição Whisper")
-        await thinking.edit_text("❌ Não consegui transcrever o áudio agora. Tenta outra vez.")
+        await thinking.edit_text("❌ Não consegui transcrever o áudio agora (os dois motores falharam). Tenta outra vez.")
         return
     if not texto:
         await thinking.edit_text("🤔 Não percebi nada no áudio (silêncio?).")
