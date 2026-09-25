@@ -206,7 +206,7 @@ def teclado_menu():
         "▪️ /news — notícias da atualidade (ex: `/news tecnologia`)\n"
         "▪️ /wiki — pesquisa na Wikipédia (ex: `/wiki Portugal`)\n"
         "▪️ /image — gera uma imagem (ex: `/image gato astronauta`)\n"
-        "▪️ /audio — gera um clipe de voz com a frase que você escrever (ex: `/audio bem-vindos ao grupo`)\n"
+        "▪️ /audio — pergunta por texto e ouve a resposta em voz 🎙 (ex: `/audio quem é o presidente da República?`)\n"
         "▪️ /voz — clipe de voz em português de Portugal 🇵🇹 (ex: `/voz boa noite` ou `/voz raquel olá!`)\n"
         "▪️ /ouvir — envia um clip de voz e ele responde com texto + IA 🎙 (ou responde a um voice com `/ouvir`)\n"
         "▪️ /falar — o mesmo, mas a resposta chega em voz pt-PT (ex: responde a um voice com `/falar raquel`)\n"
@@ -729,33 +729,22 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await thinking.edit_text(f"🎨 A imagem foi gerada, mas não consegui enviá-la. Vê aqui:\n{url}")
 
 
-# --- /audio (TTS via Google Translate, gratuito, sem chaves) ---
+# --- /audio: pergunta por texto e recebe a resposta em voz; clips de voz são respondidos em voz ---
 
-async def cmd_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    text = " ".join(context.args).strip()
-    if not text:
-        await update.message.reply_text(
-            "Como usar:\n`/audio frase que queres ouvir`\n\n"
-            "Exemplo: `/audio bem-vindos ao grupo, aqui falamos de futebol`",
-            parse_mode="Markdown",
-        )
-        return
-    if user and _rate_limited(user.id):
-        await update.message.reply_text("⏳ Muitos pedidos seguidos! Espera um pouco.")
-        return
-    if len(text) > 1500:
-        await update.message.reply_text("✂️ Texto demasiado longo — máximo de 1500 caracteres de cada vez.")
-        return
+_AUDIO_AI_SYSTEM = (
+    "You are NEOBOT's voice mode. The user's message will be read aloud as a voice note. "
+    "If the message is a question or a request for information, answer it concisely "
+    "(under 90 words) in Portuguese of Portugal, plain text, no markdown, no lists. "
+    "If the message is not a question (a greeting, an announcement or text meant to be read), "
+    "reply with exactly the same text, unchanged."
+)
 
-    thinking = await update.message.reply_text("🔊 A gerar a mensagem de voz...")
 
-    # Deteção de idioma: cirílico → ru, caso contrário pt
-    lang = "ru" if re.search(r"[а-яА-ЯёЁ]", text) else "pt"
-
-    # Google TTS принимает максимум ~200 символов — режем на куски по границе слов
+async def _tts_fallback_google(texto: str) -> bytes | None:
+    """Google Translate TTS (sotaque pt-BR) — fallback se o edge-tts falhar."""
+    lang = "ru" if re.search(r"[а-яА-ЯёЁ]", texto) else "pt"
     chunks: list[str] = []
-    rest = text
+    rest = texto
     while rest:
         if len(rest) <= 190:
             chunks.append(rest)
@@ -765,31 +754,98 @@ async def cmd_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             cut = 190
         chunks.append(rest[:cut].strip())
         rest = rest[cut:].strip()
-
     audio = bytearray()
     try:
         async with httpx.AsyncClient(timeout=30, headers=UA_BROWSER, follow_redirects=True) as client:
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 resp = await client.get(
                     "https://translate.google.com/translate_tts",
-                    params={"ie": "UTF-8", "q": chunk, "tl": lang, "client": "tw-ob", "total": len(chunks), "idx": chunks.index(chunk), "voice": "male"},
+                    params={"ie": "UTF-8", "q": chunk, "tl": lang, "client": "tw-ob", "total": len(chunks), "idx": i, "voice": "male"},
                 )
                 resp.raise_for_status()
                 if resp.content[:2] not in (b"\xff\xf3", b"\xff\xf2") and resp.content[:3] != b"ID3":
-                    raise ValueError("Не аудио в ответе")
+                    raise ValueError("não é áudio")
                 audio.extend(resp.content)
     except Exception:
-        logger.exception("Falha /audio")
+        logger.exception("TTS Google de fallback falhou")
+        return None
+    return bytes(audio) or None
+
+
+async def _responder_em_voz(msg, thinking, texto_lido: str, resposta: str, voz: str) -> None:
+    """Converte a resposta em voz pt-PT e envia como nota de voz (fallback Google)."""
+    nome = "Duarte" if voz.endswith("DuarteNeural") else "Raquel"
+    audio = None
+    if edge_tts is not None:
+        try:
+            audio = await asyncio.wait_for(_voz_gerar(resposta, voz), timeout=90)
+        except Exception:
+            logger.exception("edge-tts falhou no /audio")
+    if not audio:
+        audio = await _tts_fallback_google(resposta)
+        nome = "Google TTS"
+    if not audio:
         await thinking.edit_text("❌ Não consegui gerar a voz agora. Tenta outra vez num instante.")
         return
-
-    caption = f"🎙 {html.escape(text[:150])}"
+    caption = f"🗣 {html.escape(texto_lido[:140])}"
+    if resposta.strip() != texto_lido.strip():
+        caption += f"\n🤖 {html.escape(resposta[:300])}"
+    caption += f"\n🎙 {nome}"
     try:
-        await update.message.reply_voice(voice=bytes(audio), caption=caption, parse_mode=ParseMode.HTML)
+        await msg.reply_voice(voice=audio, caption=caption, parse_mode=ParseMode.HTML)
         await thinking.delete()
     except Exception:
         logger.exception("Falha ao enviar voz /audio")
         await thinking.edit_text("❌ A voz foi gerada, mas o Telegram não aceitou o ficheiro. Tenta algo mais curto.")
+
+
+async def cmd_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pergunta por texto e ouve a resposta da IA em voz pt-PT; responde em voz a clips de voz."""
+    msg = update.message
+    user = update.effective_user
+    texto = " ".join(context.args).strip()
+    voz = _VOZES_PT["duarte"]
+    partes = texto.split(" ", 1)
+    if len(partes) == 2 and partes[0].lower() in _VOZES_PT:
+        voz = _VOZES_PT[partes[0].lower()]
+        texto = partes[1].strip()
+
+    # Respondendo a um clip de voz (ou áudio): transcreve e responde em áudio
+    alvo = msg.reply_to_message
+    if alvo and (alvo.voice or alvo.audio):
+        await _processar_voz(update, context, "falar", None)
+        return
+
+    if not texto:
+        await msg.reply_text(
+            "🎙 *Audio — fala comigo por voz*\n\n"
+            "• `/audio quem ganhou o jogo do Porto?` → respondo em áudio\n"
+            "• `/audio bem-vindos ao grupo!` → leio o teu texto em voz\n"
+            "• `/audio raquel <texto>` → voz feminina\n"
+            "• Responde a um clip de voz com `/audio` → respondo em áudio ao que disseste",
+            parse_mode="Markdown",
+        )
+        return
+    if user and _rate_limited(user.id):
+        await msg.reply_text("⏳ Muitos pedidos seguidos! Espera um pouco.")
+        return
+    if len(texto) > 1000:
+        await msg.reply_text("✂️ Texto demasiado longo — máximo de 1000 caracteres.")
+        return
+
+    thinking = await msg.reply_text("🎙 A pensar e a preparar a voz...")
+    resposta = ""
+    if _groq_key():
+        try:
+            resposta = (
+                await asyncio.wait_for(_groq_chat(GROQ_MODEL, _AUDIO_AI_SYSTEM, texto), timeout=60)
+            ).strip()
+        except Exception:
+            logger.exception("IA falhou no /audio")
+            resposta = ""
+    if not resposta:
+        resposta = texto  # sem IA disponível: lê o texto tal e qual
+    await _responder_em_voz(msg, thinking, texto, resposta, voz)
 
 
 # --- /voz (TTS neural pt-PT via edge-tts: vozes Duarte e Raquel) ---
@@ -3911,6 +3967,7 @@ async def _post_init(app: Application) -> None:
                 BotCommand("capcut", "Alternativas ao CapCut 🎬"),
                 BotCommand("voz", "Voz pt-PT: lê o teu texto 🎙"),
                 BotCommand("ouvir", "Envia voz: responde com IA 🎙"),
+                BotCommand("audio", "Pergunta e ouve a resposta 🎙"),
                 BotCommand("hora", "Que horas são"),
                 BotCommand("opencode", "OpenCode: tarefa de código 🤖"),
             ]
