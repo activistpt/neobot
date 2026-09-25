@@ -208,6 +208,8 @@ def teclado_menu():
         "▪️ /image — gera uma imagem (ex: `/image gato astronauta`)\n"
         "▪️ /audio — gera um clipe de voz com a frase que você escrever (ex: `/audio bem-vindos ao grupo`)\n"
         "▪️ /voz — clipe de voz em português de Portugal 🇵🇹 (ex: `/voz boa noite` ou `/voz raquel olá!`)\n"
+        "▪️ /ouvir — envia um clip de voz e ele responde com texto + IA 🎙 (ou responde a um voice com `/ouvir`)\n"
+        "▪️ /falar — o mesmo, mas a resposta chega em voz pt-PT (ex: responde a um voice com `/falar raquel`)\n"
         "▪️ /meteo — meteorologia (ex: `/meteo Lisboa`)\n"
         "▪️ /youtube — pesquisa no YouTube (ex: `/youtube tutorial python`)\n"
         "▪️ /crypto — preços de crypto (ex: `/crypto btc`)\n"
@@ -857,6 +859,126 @@ async def cmd_voz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logger.exception("Falha ao enviar voz /voz")
         await thinking.edit_text("❌ A voz foi gerada, mas o Telegram não aceitou o ficheiro.")
+
+
+# --- /ouvir e /falar: le clips de voz (Whisper na Groq) e responde por texto ou voz pt-PT ---
+
+_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3-turbo")
+_VOZ_AI_MAX_MB = 20
+
+
+async def _groq_transcrever(audio: bytes, nome: str) -> str:
+    """Transcreve áudio com o Whisper (mesma API key Groq do /ask)."""
+    headers = {"Authorization": f"Bearer {_groq_key()}", "User-Agent": GROQ_HEADERS["User-Agent"]}
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post(
+            _WHISPER_URL,
+            headers=headers,
+            files={"file": (nome, audio, "application/octet-stream")},
+            data={"model": _WHISPER_MODEL},
+        )
+        resp.raise_for_status()
+        return resp.json().get("text", "").strip()
+
+
+async def _processar_voz(update: Update, context: ContextTypes.DEFAULT_TYPE, modo: str, voz_pedida: str | None) -> None:
+    """Fluxo comum: descarrega o áudio → transcreve → responde (texto ou voz)."""
+    msg = update.effective_message
+    user = update.effective_user
+    if user and _rate_limited(user.id):
+        await msg.reply_text("⏳ Muitos pedidos seguidos! Espera um pouco.")
+        return
+    if not _groq_key():
+        await msg.reply_text("⚠️ A transcrição de voz precisa da GROQ_API_KEY (não configurada neste ambiente).")
+        return
+    alvo = msg.reply_to_message or msg
+    media = alvo.voice or alvo.audio
+    if not media:
+        await msg.reply_text(
+            "🎙 Envia um clip de voz (ou responde a um com este comando).\n"
+            "• /ouvir — responde com texto + IA\n"
+            "• /falar — responde com voz pt-PT"
+        )
+        return
+    if media.file_size and media.file_size > _VOZ_AI_MAX_MB * 1024 * 1024:
+        await msg.reply_text(f"📦 Áudio demasiado grande (máx. {_VOZ_AI_MAX_MB} MB).")
+        return
+    thinking = await msg.reply_text("🎙 A ouvir...")
+    try:
+        tg_file = await context.bot.get_file(media.file_id)
+        dados = bytes(await tg_file.download_as_bytearray())
+    except Exception:
+        logger.exception("Falha ao descarregar áudio")
+        await thinking.edit_text("❌ Não consegui descarregar o teu áudio.")
+        return
+    try:
+        texto = await asyncio.wait_for(
+            _groq_transcrever(dados, media.file_name or "voz.ogg"), timeout=120
+        )
+    except Exception:
+        logger.exception("Falha na transcrição Whisper")
+        await thinking.edit_text("❌ Não consegui transcrever o áudio agora. Tenta outra vez.")
+        return
+    if not texto:
+        await thinking.edit_text("🤔 Não percebi nada no áudio (silêncio?).")
+        return
+
+    try:
+        resposta = await asyncio.wait_for(
+            _groq_chat(GROQ_MODEL, GROQ_SYSTEM_PROMPT, texto), timeout=60
+        )
+    except Exception:
+        logger.exception("IA falhou no fluxo de voz")
+        resposta = ""
+
+    if modo == "falar":
+        if edge_tts is None or not resposta:
+            corpo = f"🗣 {html.escape(texto)}"
+            if resposta:
+                corpo += f"\n\n🤖 {html.escape(resposta)}"
+            await thinking.edit_text(corpo)
+            return
+        voz = _VOZES_PT.get(voz_pedida or "duarte", _VOZES_PT["duarte"])
+        try:
+            audio = await asyncio.wait_for(_voz_gerar(resposta, voz), timeout=90)
+        except Exception:
+            logger.exception("Falha ao gerar voz da resposta")
+            audio = None
+        if audio:
+            nome = "Duarte" if voz.endswith("DuarteNeural") else "Raquel"
+            await thinking.delete()
+            await msg.reply_voice(
+                voice=audio,
+                caption=(
+                    f"🗣 {html.escape(texto[:150])}\n"
+                    f"🤖 {html.escape(resposta[:400])}\n"
+                    f"🎙 {nome}"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # edge-tts falhou → cai para resposta em texto
+
+    corpo = f"🗣 <b>Disseste:</b>\n<i>{html.escape(texto)}</i>"
+    if resposta:
+        corpo += f"\n\n🤖 <b>Resposta:</b>\n{html.escape(resposta)}"
+    try:
+        await thinking.edit_text(corpo, parse_mode=ParseMode.HTML)
+    except Exception:
+        await thinking.edit_text(corpo)
+
+
+async def cmd_ouvir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lê um clip de voz e responde com a transcrição + resposta da IA (texto)."""
+    voz_pedida = context.args[0].lower() if context.args and context.args[0].lower() in _VOZES_PT else None
+    await _processar_voz(update, context, "transcrever", voz_pedida)
+
+
+async def cmd_falar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lê um clip de voz e responde com voz pt-PT (Duarte por omissão, Raquel opcional)."""
+    voz_pedida = context.args[0].lower() if context.args and context.args[0].lower() in _VOZES_PT else None
+    await _processar_voz(update, context, "falar", voz_pedida)
 
 
 # --- /meteo (Open-Meteo) ---
@@ -3788,6 +3910,7 @@ async def _post_init(app: Application) -> None:
                 BotCommand("streamhub", "Sites de streaming"),
                 BotCommand("capcut", "Alternativas ao CapCut 🎬"),
                 BotCommand("voz", "Voz pt-PT: lê o teu texto 🎙"),
+                BotCommand("ouvir", "Envia voz: responde com IA 🎙"),
                 BotCommand("hora", "Que horas são"),
                 BotCommand("opencode", "OpenCode: tarefa de código 🤖"),
             ]
@@ -3851,6 +3974,10 @@ def main() -> None:
     app.add_handler(CommandHandler("streamhub", cmd_streamhub))
     app.add_handler(CommandHandler("capcut", cmd_capcut))
     app.add_handler(CommandHandler("voz", cmd_voz))
+    app.add_handler(CommandHandler("ouvir", cmd_ouvir))
+    app.add_handler(CommandHandler("falar", cmd_falar))
+    # Clip de voz/áudio sem comando: transcreve + responde por texto (igual ao /ouvir)
+    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, cmd_ouvir))
     app.add_handler(CommandHandler("iptv", cmd_iptv))
     app.add_handler(CommandHandler("canal", cmd_canal))
     app.add_handler(CommandHandler("webcams", cmd_webcams))
