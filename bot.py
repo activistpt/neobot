@@ -2980,6 +2980,59 @@ def _run_wan(image_path: str, prompt: str) -> str:
     raise RuntimeError("Sem quota ZeroGPU disponível hoje (todas as contas HF esgotadas)")
 
 
+def _ace_generate(style: str, lyrics: str, duracao: float) -> str:
+    """Bloqueante — gera música cantada no ACE-Step v1 (open source; conta para a
+    quota ZeroGPU mas gasta ~25-60s por música, muito menos que o YuE).
+    Rotação de tokens HF como no YuE. Devolve o caminho local do ficheiro."""
+    from gradio_client import Client
+    ultimo_erro: Exception | None = None
+    for tok in _hf_tokens():
+        if not _hf_alive(tok):
+            continue
+        try:
+            c = Client("ACE-Step/ACE-Step", token=tok, verbose=False,
+                       httpx_kwargs={"timeout": 600})
+            r = c.predict(
+                audio_duration=float(duracao),
+                prompt=style[:400],
+                lyrics=lyrics,
+                infer_step=27,               # ~23s de geração; 60 = máxima qualidade
+                guidance_scale=15.0,
+                scheduler_type="euler",
+                cfg_type="apg",
+                omega_scale=10.0,
+                manual_seeds=None,
+                guidance_interval=0.5,
+                guidance_interval_decay=0.0,
+                min_guidance_scale=3.0,
+                use_erg_tag=True,
+                use_erg_lyric=False,
+                use_erg_diffusion=True,
+                oss_steps=None,
+                guidance_scale_text=0.0,
+                guidance_scale_lyric=0.0,
+                audio2audio_enable=False,
+                ref_audio_strength=0.5,
+                ref_audio_input=None,
+                lora_name_or_path="none",
+                api_name="/__call__",
+            )
+            a = r[0] if isinstance(r, (tuple, list)) and r else r
+            p = str(a[0]) if isinstance(a, (list, tuple)) and a else str(a)
+            if not p or not os.path.exists(p):
+                raise RuntimeError("ACE-Step não devolveu áudio")
+            return p
+        except Exception as exc:
+            if "quota" in str(exc).lower() or "gpu duration" in str(exc).lower():
+                _hf_mark_dead(tok)
+                ultimo_erro = exc
+                continue
+            raise
+    if ultimo_erro:
+        raise ultimo_erro
+    raise RuntimeError("Sem quota ZeroGPU disponível hoje (todas as contas HF esgotadas)")
+
+
 async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tema = " ".join(context.args).strip()
     if not tema:
@@ -2988,9 +3041,8 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Exemplos:\n"
             "· `/music uma balada sobre saudade de Lisboa`\n"
             "· `/music rap engraçado sobre exames`\n\n"
-            "🤖 A música é gerada pelo YuE (modelo open source que canta a letra escrita "
-            "pela IA). Se estiver indisponível, tenta o Lyria da Google ou o MusicGen. "
-            "Pode demorar 1-2 minutos.",
+            "🤖 A música é gerada pelo ACE-Step (modelo open source que canta a letra "
+            "escrita pela IA), com fallback YuE e MusicGen. Pode demorar 1-3 minutos.",
             parse_mode="Markdown",
         )
         return
@@ -2998,10 +3050,10 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user:
         agora = time.time()
         ultimo = _music_last.get(user.id, 0)
-        if agora - ultimo < 600:
-            falta = int(600 - (agora - ultimo))
+        if agora - ultimo < 120:
+            falta = int(120 - (agora - ultimo))
             await update.message.reply_text(
-                f"⏳ A geração de música usa muita GPU — espera {falta // 60}m{falta % 60:02d}s e tenta outra vez."
+                f"⏳ Acabaste de gerar uma música — espera {falta}s para outra (a fila é partilhada)."
             )
             return
         _music_last[user.id] = agora
@@ -3053,7 +3105,8 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
-    # 1) Groq escreve a letra personalizada (tags [verse]/[chorus] que o YuE entende)
+    # 1) A letra sai de um LLM NÃO-raciocinador (o gpt-oss 'pensa' e esvazia os tokens);
+    # llama-3.3-70b-versatile responde letra completa no primeiro try.
     system = (
         "Escreve a letra completa de uma canção original em português de Portugal. "
         "Usa EXATAMENTE este formato com tags em inglês e versos curtos (2-4 linhas cada): "
@@ -3065,38 +3118,60 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Responde também, na 1.ª linha antes da letra, uma descrição curta do estilo musical "
         "em inglês no formato exato: STYLE: <descrição em inglês com género, ritmo e instrumentos>"
     )
-    try:
-        raw = await _groq_chat(GROQ_MODEL, system, user_prompt, max_tokens=700)
-    except Exception:
-        logger.exception("Groq falhou em /music")
-        await thinking.edit_text("❌ Não consegui escrever a letra (erro da IA de texto). Tenta outra vez.")
+    letra = ""
+    style = ""
+    for modelo_letra in ("qwen/qwen3.8-27b", GROQ_MODEL):
+        try:
+            raw = await _groq_chat(modelo_letra, system, user_prompt, max_tokens=900)
+        except Exception:
+            logger.exception("Groq falhou em /music (%s)", modelo_letra)
+            continue
+        m = re.search(r"STYLE:\s*(.+)", raw)
+        style_cand = m.group(1).strip()[:200] if m else ""
+        letra_cand = (raw[m.end():] if m else raw)
+        letra_cand = re.sub(r"\n{3,}", "\n\n", letra_cand).strip()
+        # limpa raciocínio <think>...</think> se algum modelo o incluir
+        letra_cand = re.sub(r"<[a-z_]+>.*?</[a-z_]+>", "", letra_cand, flags=re.S).strip()
+        if letra_cand and len(letra_cand.splitlines()) >= 4:
+            letra, style = letra_cand, style_cand
+            break
+    if not style:
+        style = "upbeat pop song with synth and energetic drums, catchy vocals"
+    if not letra:
+        await thinking.edit_text("❌ Não consegui escrever a letra agora (a IA de texto não respondeu). Tenta outra vez.")
         return
 
-    style = "upbeat pop song with synth and energetic drums, catchy female vocals"
-    letra = raw
-    m = re.search(r"STYLE:\s*(.+)", raw)
-    if m:
-        style = m.group(1).strip()[:200]
-        letra = raw[m.end():].strip()
-    letra = re.sub(r"\n{3,}", "\n\n", letra).strip()
-    if not letra:
-        await thinking.edit_text("❌ A letra saiu vazia — tenta reformular o tema.")
-        return
+    # Duração adaptativa (mais curta = menos quota ZeroGPU por música)
+    n_linhas = len(letra.splitlines())
+    duracao = 30.0 if n_linhas <= 12 else 38.0 if n_linhas <= 20 else 45.0
 
     await thinking.edit_text(
-        f"🎵 Letra pronta ({len(letra.splitlines())} linhas)!\n🎚 Estilo: {style[:100]}\n\n"
-        "🎹 A gerar a música com o YuE (open source, canta a letra)... (1-2 minutos)"
+        f"🎵 Letra pronta ({n_linhas} linhas)!\n🎚 Estilo: {style[:100]}\n\n"
+        f"🎹 A gerar ~{duracao:.0f}s de música com o ACE-Step (open source, canta a letra)... (1-3 minutos)"
     )
 
-    # 2) YuE gera a música cantada (bloqueante → thread)
+    # 2) ACE-Step primeiro (quota zero-a10g folgada); YuE de fallback
     import tempfile as _tfd
     tmpdir = _tfd.mkdtemp(prefix="neobot_music_")
+    dest = ""
+    motor = "ACE-Step"
     try:
-        dest = await asyncio.to_thread(_yue_generate, style, letra)
-    except Exception as exc:
-        logger.exception("YuE falhou em /music")
-        if "quota" in str(exc).lower() or "GPU" in str(exc):
+        dest = await asyncio.to_thread(_ace_generate, style, letra, duracao)
+    except Exception as exc_ace:
+        logger.warning("ACE-Step falhou em /music: %s", str(exc_ace)[:200])
+        try:
             await thinking.edit_text(
+                "🔄 O ACE-Step não respondeu — a gerar pelo YuE (motor alternativo)..."
+            )
+        except Exception:
+            pass
+        motor = "YuE"
+        try:
+            dest = await asyncio.to_thread(_yue_generate, style, letra)
+        except Exception as exc:
+            logger.exception("YuE também falhou em /music")
+            if "quota" in str(exc).lower() or "GPU" in str(exc):
+                await thinking.edit_text(
                 "⏳ GPU gratuita esgotada — a gerar uma versão instrumental na CPU do servidor "
                 "(MusicGen, pode demorar até 5 min)..."
             )
@@ -3133,7 +3208,7 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await thinking.edit_text("❌ A geração de música falhou. Tenta outra vez dentro de alguns minutos.")
         return
 
-    # 3) enviar (o YuE já devolve o ficheiro local)
+    # 3) enviar (o motor já devolve o ficheiro local)
     try:
         if os.path.getsize(dest) > TG_FILE_LIMIT:
             await thinking.edit_text("✅ Música gerada, mas o ficheiro excede 50 MB.")
@@ -3142,8 +3217,8 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_audio(
             audio=open(dest, "rb"),
             title=tema[:60],
-            performer="NEOBOT · YuE",
-            caption=f"🎼 {titulo}\n🎚 {html.escape(style[:100])}",
+            performer=f"NEOBOT · {motor}",
+            caption=f"🎼 {titulo}\n🎚 {html.escape(style[:100])}\n🤖 {motor} (open source)",
             parse_mode=ParseMode.HTML,
         )
         await thinking.delete()
@@ -3151,9 +3226,9 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Falha ao enviar /music")
         await thinking.edit_text("❌ A música foi gerada mas o envio falhou. Tenta outra vez.")
     finally:
-        for f in [dest]:
+        if dest:
             try:
-                os.remove(f)
+                os.remove(dest)
             except OSError:
                 pass
         try:
