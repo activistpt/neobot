@@ -225,7 +225,7 @@ def teclado_menu():
         "▪️ /canal — procura canais IPTV 📺 (ex: `/canal sport tv`)\n"
         "▪️ /video — gera vídeo a partir de texto ou anima uma imagem 🎬 (ex: `/video um dragão a voar`)\n"
         "▪️ /opencode — executa uma tarefa de código via OpenCode local 🤖 (ex: `/opencode lista os ficheiros`)\n"
-        "▪️ /opencode_status — estado da sessão OpenCode interativa\n"
+        "▪️ `/opencode_status` — estado da sessão OpenCode interativa\n"
         "▪️ /avatar — avatar falante: responde a uma foto com `/avatar olá!` 🗣\n"
         "▪️ /ajuda — mostra esta mensagem\n\n"
         "Escolhe um botão abaixo ou escreve um comando! 👇"
@@ -233,10 +233,13 @@ def teclado_menu():
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        f"Olá, *{update.effective_user.first_name}*! 👋\n\n{teclado_menu()}",
-        parse_mode="Markdown",
-    )
+    try:
+        await update.message.reply_text(
+            f"Olá, *{update.effective_user.first_name}*! 👋\n\n{teclado_menu()}",
+            parse_mode="Markdown",
+        )
+    except Exception:  # entidades Markdown quebradas (ex: nome com _) — envia a limpo
+        await update.message.reply_text(f"Olá, {update.effective_user.first_name}! 👋\n\n{teclado_menu()}")
 
 
 async def neobot_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -259,7 +262,10 @@ async def neobot_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(teclado_menu(), parse_mode="Markdown")
+    try:
+        await update.message.reply_text(teclado_menu(), parse_mode="Markdown")
+    except Exception:  # texto com entidades Markdown quebradas — envia a limpo
+        await update.message.reply_text(teclado_menu())
 
 
 async def cmd_hora(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
