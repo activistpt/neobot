@@ -1004,6 +1004,33 @@ async def _transcrever_audio(dados: bytes, nome: str) -> str:
         except Exception as e:
             erros.append(f"HF: {e}")
             logger.warning("Whisper HF falhou: %s", str(e)[:140])
+    # 3º motor: Space público openai/whisper (gradio, sem quota ZeroGPU)
+    try:
+        def _space_transcribe() -> str:
+            from gradio_client import Client, handle_file
+
+            tmp = os.path.join(tempfile.gettempdir(), f"whisper_in_{os.getpid()}" + os.path.splitext(nome)[1] or ".ogg")
+            with open(tmp, "wb") as fh:
+                fh.write(dados)
+            try:
+                cliente = Client("openai/whisper")
+                resultado = cliente.predict(inputs=handle_file(tmp))
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            if isinstance(resultado, (list, tuple)) and resultado:
+                resultado = resultado[0]
+            return str(resultado).strip()
+
+        texto = await asyncio.to_thread(_space_transcribe)
+        if texto:
+            return texto
+        erros.append("Space openai/whisper: resposta vazia")
+    except Exception as e:
+        erros.append(f"Space: {e}")
+        logger.warning("Whisper Space falhou: %s", str(e)[:140])
     raise RuntimeError("; ".join(erros) or "nenhum motor de transcrição disponível")
 
 
