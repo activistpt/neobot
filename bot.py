@@ -3532,6 +3532,47 @@ async def _video_prompt_en(texto: str) -> str:
     return texto
 
 
+# --- /video, 2.º motor (grátis): CogVideoX-5B oficial (Zhipu, ZeroGPU) — T2V verdadeiro ---
+
+COGVIDEO_SPACE = "zai-org/CogVideoX-5B-Space"
+
+
+def _run_cogvideo(prompt: str) -> str:
+    """Bloqueante — texto→vídeo com o CogVideoX-5B oficial (open source, Space ZeroGPU),
+    com rotação de tokens HF. Devolve o caminho local do MP4 ou levanta exceção."""
+    from gradio_client import Client
+    ultimo_erro: Exception | None = None
+    for tok in _hf_tokens():
+        if not _hf_alive(tok):
+            continue
+        try:
+            c = Client(COGVIDEO_SPACE, token=tok, verbose=False,
+                       httpx_kwargs={"timeout": 400})
+            r = c.predict(
+                prompt=(prompt or "cinematic scene, smooth motion")[:900],
+                image_input=None,          # None → texto→vídeo verdadeiro
+                video_input=None,
+                video_strength=1.0,
+                seed_value=random.randint(1, 999999),
+                scale_status=False,        # upscale SD gasta quota extra
+                rife_status=True,          # interpolação → movimento suave
+                api_name="/generate",
+            )
+            vid = r[0].get("video") if isinstance(r, (tuple, list)) and isinstance(r[0], dict) else None
+            if not vid or not os.path.exists(str(vid)):
+                raise RuntimeError("CogVideoX não devolveu vídeo")
+            return str(vid)
+        except Exception as exc:
+            if "quota" in str(exc).lower() or "gpu duration" in str(exc).lower():
+                _hf_mark_dead(tok)
+                ultimo_erro = exc
+                continue
+            raise
+    if ultimo_erro:
+        raise ultimo_erro
+    raise RuntimeError("Sem quota ZeroGPU disponível hoje (todas as contas HF esgotadas)")
+
+
 def _video_quota_msg(exc: Exception) -> str | None:
     """Detecta erro de quota ZeroGPU para mensagem amigável."""
     s = str(exc)
@@ -3612,7 +3653,33 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     pass
         return
 
-    # ── 2.º motor: LTX-Video destilado (Space ZeroGPU grátis) — T2V direto, sem imagem ──
+    # ── 2.º motor: CogVideoX-5B (Space ZeroGPU grátis) — T2V verdadeiro, aderente ao prompt ──
+    if not img_for_ltx:
+        try:
+            await thinking.edit_text("🎬 A gerar o vídeo com o CogVideoX-5B (open source)... 2-4 min")
+            cog_path = await asyncio.to_thread(_run_cogvideo, prompt_en)
+            try:
+                await update.message.reply_video(
+                    video=open(cog_path, "rb"),
+                    caption=f"🎬 {html.escape(texto[:120])}\n🤖 CogVideoX-5B · open source",
+                    parse_mode=ParseMode.HTML,
+                )
+                await thinking.delete()
+            except Exception:
+                logger.exception("Falha ao enviar vídeo CogVideoX")
+                await thinking.edit_text("❌ O vídeo foi gerado mas o envio falhou. Tenta outra vez.")
+            finally:
+                try:
+                    os.remove(cog_path)
+                except OSError:
+                    pass
+            return
+        except Exception as exc:
+            logger.exception("CogVideoX falhou em /video — tento o LTX")
+            if _video_quota_msg(exc):
+                await thinking.edit_text("⏳ Quota ZeroGPU esgotada — a tentar motor alternativo...")
+
+    # ── 3.º motor: LTX-Video destilado (Space ZeroGPU grátis) — T2V direto, sem imagem ──
     if not img_for_ltx:
         try:
             await thinking.edit_text("🎬 A gerar o vídeo com o LTX-Video (open source)... 1-2 min")
