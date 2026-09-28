@@ -6,6 +6,7 @@ Comandos: /start, /ajuda, /piada, /ask, /google, /news e muitos mais (ver /ajuda
 import asyncio
 import atexit
 import html
+import io
 import json
 import ipaddress
 import logging
@@ -200,7 +201,7 @@ def teclado_menu():
         "▪️ /google — pesquisa na internet (ex: `/google últimas notícias do GPL`)\n"
         "▪️ /news — notícias da atualidade (ex: `/news tecnologia`)\n"
         "▪️ /wiki — pesquisa na Wikipédia (ex: `/wiki Portugal`)\n"
-        "▪️ /image — gera uma imagem (ex: `/image gato astronauta`)\n"
+        "▪️ /image — gera uma imagem com IA (ex: `/image gato astronauta`)\n"
         "▪️ /audio — pergunta qualquer coisa: pesquiso na web e respondo em voz 🎙 (ex: `/audio notícias de hoje`)\n"
         "▪️ /voz — clipe de voz em português de Portugal 🇵🇹 (ex: `/voz boa noite` ou `/voz raquel olá!`)\n"
         "▪️ Nota de voz — envia um clip de voz e respondo em áudio 🎙 (fala à vontade!)\n"
@@ -692,36 +693,78 @@ async def cmd_wiki(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await thinking.edit_text(answer)
 
 
-# --- /img (Z-Image via Pollinations — modelo da zimage.run) ---
+# --- /image (HF Inference Providers: Z-Image-Turbo com o HF_TOKEN; fallback Pollinations z-image) ---
+
+_HF_IMAGE_MODEL = "Tongyi-MAI/Z-Image-Turbo"  # rápido, barato em créditos HF
+
+
+def _hf_token() -> str:
+    return os.environ.get("HF_TOKEN", "").strip()
+
+
+async def _hf_image(prompt: str) -> bytes | None:
+    """Gera uma imagem via HF Inference Providers (rota automática de providers).
+
+    Usa o cliente oficial huggingface_hub, que encaminha para fal-ai/replicate/etc.
+    Devolve None (→ fallback Pollinations) se não houver token, créditos ou falha.
+    """
+    token = _hf_token()
+    if not token:
+        return None
+    try:
+        from huggingface_hub import AsyncInferenceClient
+    except ImportError:
+        logger.warning("/image: huggingface_hub não instalado — a usar fallback")
+        return None
+    client = AsyncInferenceClient(token=token, provider="auto")
+    try:
+        img = await asyncio.wait_for(
+            client.text_to_image(prompt[:800], model=_HF_IMAGE_MODEL), timeout=120
+        )
+    except Exception as exc:
+        logger.warning("HF /image falhou: %s: %s", type(exc).__name__, str(exc)[:200])
+        return None
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _pollinations_image_url(prompt: str) -> str:
+    return (
+        "https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt)
+        + f"?width=1024&height=1024&nologo=true&model=z-image&seed={random.randint(1, 999999)}"
+    )
+
 
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     prompt = " ".join(context.args).strip()
     if not prompt:
-        await update.message.reply_text(            "Como usar:\n`/image gato astronauta a flutuar no espaço`", parse_mode="Markdown")
+        await update.message.reply_text("Como usar:\n`/image gato astronauta a flutuar no espaço`", parse_mode="Markdown")
         return
     if user and _rate_limited(user.id):
         await update.message.reply_text("⏳ Muitas imagens seguidas! Espera um pouco.")
         return
-    thinking = await update.message.reply_text("🎨 A gerar a imagem...")
-    url = (
-        "https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt)
-        + f"?width=1024&height=1024&nologo=true&model=z-image&seed={random.randint(1, 999999)}"
-    )
-    try:
-        resp = await _http_get(url, timeout=120)
-        image_bytes = resp.content
-    except Exception:
-        logger.exception("Falha /img")
-        await thinking.edit_text("❌ A geração de imagens falhou agora. Tenta outra vez em instantes.")
-        return
-    caption = f"🎨 {html.escape(prompt[:200])}"
+    thinking = await update.message.reply_text("🎨 A gerar a imagem (IA)...")
+    fonte = "HF · Z-Image-Turbo"
+    image_bytes = await _hf_image(prompt)
+    if image_bytes is None:
+        await thinking.edit_text("🎨 A HF não respondeu — a tentar a fonte alternativa...")
+        fonte = "Pollinations"
+        try:
+            resp = await _http_get(_pollinations_image_url(prompt), timeout=120)
+            image_bytes = resp.content
+        except Exception:
+            logger.exception("Falha /img (fallback Pollinations)")
+            await thinking.edit_text("❌ A geração de imagens falhou agora. Tenta outra vez em instantes.")
+            return
+    caption = f"🎨 {html.escape(prompt[:200])} — via {fonte}"
     try:
         await update.message.reply_photo(photo=image_bytes, caption=caption, parse_mode=ParseMode.HTML)
         await thinking.delete()
     except Exception:
         logger.exception("Falha ao enviar foto /img")
-        await thinking.edit_text(f"🎨 A imagem foi gerada, mas não consegui enviá-la. Vê aqui:\n{url}")
+        await thinking.edit_text(f"🎨 A imagem foi gerada ({fonte}), mas não consegui enviá-la.")
 
 
 # --- /audio: pesquisa na web e responde por voz a tudo o que seja pedido ---

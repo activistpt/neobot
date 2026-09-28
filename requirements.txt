@@ -7,3 +7,6 @@ gradio_client>=1.0
 yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.tar.gz
 phonenumbers>=8.13
 edge-tts>=7.0
+# /image: HF Inference Providers (Z-Image-Turbo) + reencodagem JPEG
+huggingface_hub>=1.0
+pillow>=10.0
