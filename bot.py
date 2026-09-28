@@ -3445,6 +3445,61 @@ def _run_ltx(
     return payload, video_url
 
 
+# --- /video, 1.º motor: HF Inference Providers (Wan2.2, créditos HF, sem filas) ---
+
+_HF_T2V_MODEL = "Wan-AI/Wan2.2-TI2V-5B"   # texto→vídeo: 1280x704@24fps ~3.5s, rápido
+_HF_I2V_MODEL = "Wan-AI/Wan2.2-I2V-A14B"  # imagem→vídeo: qualidade máxima (MoE)
+_hf_client_video = None
+
+
+def _hf_video_client():
+    global _hf_client_video
+    if _hf_client_video is None:
+        tok = _hf_token_from_env()
+        if not tok:
+            return None
+        try:
+            from huggingface_hub import AsyncInferenceClient
+        except ImportError:
+            return None
+        _hf_client_video = AsyncInferenceClient(token=tok, provider="auto")
+    return _hf_client_video
+
+
+async def _hf_t2v(prompt: str) -> bytes | None:
+    """Texto→vídeo com o Wan2.2-TI2V-5B via HF Inference Providers.
+    Gasta créditos HF; devolve None (→ motores gratuitos) se falharem."""
+    client = _hf_video_client()
+    if client is None:
+        return None
+    try:
+        return await asyncio.wait_for(
+            client.text_to_video(
+                prompt[:800], model=_HF_T2V_MODEL, negative_prompt=VIDEO_NEGATIVE,
+            ), timeout=300)
+    except Exception as exc:
+        logger.warning("HF T2V falhou: %s: %s", type(exc).__name__, str(exc)[:160])
+        return None
+
+
+async def _hf_i2v(image_path: str, prompt: str) -> bytes | None:
+    """Imagem→vídeo com o Wan2.2-I2V-A14B via HF Inference Providers."""
+    client = _hf_video_client()
+    if client is None:
+        return None
+    try:
+        with open(image_path, "rb") as fh:
+            dados = fh.read()
+        return await asyncio.wait_for(
+            client.image_to_video(
+                dados, model=_HF_I2V_MODEL,
+                prompt=(prompt or "cinematic motion, smooth animation")[:400],
+            ), timeout=300)
+    except Exception as exc:
+        logger.warning("HF I2V falhou: %s: %s", type(exc).__name__, str(exc)[:160])
+        return None
+
+
 def _video_quota_msg(exc: Exception) -> str | None:
     """Detecta erro de quota ZeroGPU para mensagem amigável."""
     s = str(exc)
@@ -3497,6 +3552,31 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             texto = "A cena da imagem ganha vida com movimento suave"
         except Exception:
             logger.exception("Falha ao baixar imagem-URL em /video")
+    # ── 1.º motor: HF Inference Providers (Wan2.2) — créditos HF, sem fila ZeroGPU ──
+    hf_payload = None
+    if img_for_ltx:
+        hf_payload = await _hf_i2v(img_for_ltx, texto)
+    else:
+        hf_payload = await _hf_t2v(texto)
+    if hf_payload:
+        cap = (
+            f"🎬 {html.escape(texto[:120])}\n"
+            f"🤖 {'Wan2.2 I2V-A14B' if img_for_ltx else 'Wan2.2 5B T2V'} · open source (HF)"
+        )
+        try:
+            await update.message.reply_video(video=hf_payload, caption=cap, parse_mode=ParseMode.HTML)
+            await thinking.delete()
+        except Exception:
+            logger.exception("Falha ao enviar vídeo HF")
+            await thinking.edit_text("❌ O vídeo foi gerado mas o envio falhou. Tenta outra vez.")
+        finally:
+            if img_for_ltx and img_for_ltx != reply_img:
+                try:
+                    os.remove(img_for_ltx)
+                except OSError:
+                    pass
+        return
+
     # ── Fonte principal: Wan2.2 Lightning (open source) — gera a imagem inicial e anima ──
     wan_path = None
     try:
