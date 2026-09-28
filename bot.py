@@ -3438,8 +3438,16 @@ def _run_ltx(
     if image_path:
         common["input_image_filepath"] = handle_file(image_path)
     result = client.predict(**common, api_name=api)
-    video_url = result[0]["video"]["url"] if isinstance(result, tuple) else result["video"]["url"]
-    payload = _download_video_payload(video_url)
+    vid = result[0]["video"] if isinstance(result, (tuple, list)) else result["video"]
+    if isinstance(vid, dict):  # formato antigo: url remoto
+        video_url = vid.get("url", "")
+        payload = _download_video_payload(video_url)
+    elif vid and os.path.exists(str(vid)):  # formato atual: ficheiro já descarregado
+        video_url = str(vid)
+        with open(video_url, "rb") as fh:
+            payload = fh.read()
+    else:
+        return None
     if not payload:
         return None
     return payload, video_url
@@ -3576,6 +3584,30 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 except OSError:
                     pass
         return
+
+    # ── 2.º motor: LTX-Video destilado (Space ZeroGPU grátis) — T2V direto, sem imagem ──
+    if not img_for_ltx:
+        try:
+            await thinking.edit_text("🎬 A gerar o vídeo com o LTX-Video (open source)... 1-2 min")
+            loop = asyncio.get_running_loop()
+            res_ltx = await loop.run_in_executor(None, _run_ltx, texto, None, 3.0, 512.0, 704.0)
+            if res_ltx:
+                payload, url = res_ltx
+                try:
+                    await update.message.reply_video(
+                        video=payload,
+                        caption=f"🎬 {html.escape(texto[:120])}\n🤖 LTX-Video · open source",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    await thinking.delete()
+                except Exception:
+                    logger.exception("Falha ao enviar vídeo LTX")
+                    await thinking.edit_text(f"🎬 O vídeo foi gerado mas o envio falhou. Vê aqui:\n{url}")
+                return
+        except Exception as exc:
+            logger.exception("LTX T2V falhou em /video — tento o Wan")
+            if _video_quota_msg(exc):
+                await thinking.edit_text("⏳ Quota ZeroGPU esgotada — a tentar motor alternativo...")
 
     # ── Fonte principal: Wan2.2 Lightning (open source) — gera a imagem inicial e anima ──
     wan_path = None
