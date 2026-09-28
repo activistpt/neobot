@@ -3508,6 +3508,30 @@ async def _hf_i2v(image_path: str, prompt: str) -> bytes | None:
         return None
 
 
+_VIDEO_PROMPT_SYSTEM = (
+    "You translate short video descriptions into vivid English prompts for an AI text-to-video model "
+    "(LTX-Video / Wan). If the input is already in English, lightly enrich it with cinematic details "
+    "(lighting, camera, motion). Keep it ONE sentence, under 60 words, output ONLY the English prompt."
+)
+
+
+async def _video_prompt_en(texto: str) -> str:
+    """Traduz/enriquece a descrição para inglês — o LTX/Wan seguem mal outros idiomas.
+    Se a IA falhar, devolve o texto original (melhor que bloquear o comando)."""
+    if not _groq_key():
+        return texto
+    try:
+        r = await asyncio.wait_for(
+            _groq_chat(GROQ_MODEL, _VIDEO_PROMPT_SYSTEM, texto[:500], max_tokens=500), timeout=25
+        )
+        r = r.strip().strip('"')
+        if r and len(r) > 3 and not r.startswith("{"):
+            return r
+    except Exception:
+        logger.debug("Enriquecimento do prompt de vídeo falhou — uso o texto original")
+    return texto
+
+
 def _video_quota_msg(exc: Exception) -> str | None:
     """Detecta erro de quota ZeroGPU para mensagem amigável."""
     s = str(exc)
@@ -3560,12 +3584,15 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             texto = "A cena da imagem ganha vida com movimento suave"
         except Exception:
             logger.exception("Falha ao baixar imagem-URL em /video")
+    # Prompts noutras línguas seguem mal nos modelos de vídeo — traduzir/enriquecer p/ inglês
+    prompt_en = await _video_prompt_en(texto)
+
     # ── 1.º motor: HF Inference Providers (Wan2.2) — créditos HF, sem fila ZeroGPU ──
     hf_payload = None
     if img_for_ltx:
-        hf_payload = await _hf_i2v(img_for_ltx, texto)
+        hf_payload = await _hf_i2v(img_for_ltx, prompt_en)
     else:
-        hf_payload = await _hf_t2v(texto)
+        hf_payload = await _hf_t2v(prompt_en)
     if hf_payload:
         cap = (
             f"🎬 {html.escape(texto[:120])}\n"
@@ -3590,7 +3617,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await thinking.edit_text("🎬 A gerar o vídeo com o LTX-Video (open source)... 1-2 min")
             loop = asyncio.get_running_loop()
-            res_ltx = await loop.run_in_executor(None, _run_ltx, texto, None, 3.0, 512.0, 704.0)
+            res_ltx = await loop.run_in_executor(None, _run_ltx, prompt_en, None, 3.0, 512.0, 704.0)
             if res_ltx:
                 payload, url = res_ltx
                 try:
@@ -3615,7 +3642,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not img_for_ltx:
             try:
                 u = (
-                    "https://image.pollinations.ai/prompt/" + urllib.parse.quote(texto[:300])
+                    "https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt_en[:300])
                     + f"?width=768&height=768&nologo=true&model=z-image&seed={random.randint(1, 999999)}"
                 )
                 resp = await _http_get(u, timeout=120)
@@ -3629,7 +3656,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await thinking.edit_text("🎬 A animar com o Wan2.2 (open source)... 1-2 minutos")
             except Exception:
                 pass
-            wan_path = await asyncio.to_thread(_run_wan, img_for_ltx, texto)
+            wan_path = await asyncio.to_thread(_run_wan, img_for_ltx, prompt_en)
     except Exception:
         logger.exception("Wan falhou em /video — tento o LTX")
         wan_path = None
@@ -3658,7 +3685,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "🎬 A gerar o vídeo com o Veo da Google (motor do Flow)... "
                 "pode demorar 2-6 minutos"
             )
-            payload_veo = await asyncio.to_thread(_gemini_poll_video, texto)
+            payload_veo = await asyncio.to_thread(_gemini_poll_video, prompt_en)
             cap_v = f"🎬 {html.escape(texto[:120])}\n🤖 Veo · Google Flow"
             try:
                 await update.message.reply_video(video=payload_veo, caption=cap_v, parse_mode=ParseMode.HTML)
@@ -3690,7 +3717,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not kb_img:
                 try:
                     u = (
-                        "https://image.pollinations.ai/prompt/" + urllib.parse.quote(texto[:300])
+                        "https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt_en[:300])
                         + f"?width=1024&height=1024&nologo=true&model=z-image&seed={random.randint(1, 999999)}"
                     )
                     resp = await _http_get(u, timeout=120)
