@@ -1506,6 +1506,99 @@ _OPENCODE_TIMEOUT = 300  # 5 min por tarefa one-shot
 # (a continuidade real fica a cargo do OpenCode: cada continuar corre `run --continue`)
 _opencode_sessoes: dict[int, dict] = {}
 
+# Modelos free do Zen por ordem de preferência. O catálogo destes modelos é
+# volátil — IDs que desaparecem fazem o `opencode run` falhar com
+# "UnknownError ... err_..." no servidor — por isso validamos contra
+# `opencode models opencode` antes de os usar.
+_OPENCODE_MODELOS_FALLBACK = (
+    "opencode/glm-5.3-flash-free",
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/mimo-v2.6-flash-free",
+    "opencode/beam-free",
+)
+_opencode_model_cache: dict[str, str | None] = {}
+
+
+def _opencode_config_model() -> str | None:
+    """Lê o `model` do opencode.json(c) global (respeita OPENCODE_CONFIG*)."""
+    candidatos: list[str] = []
+    if os.environ.get("OPENCODE_CONFIG"):
+        candidatos.append(os.environ["OPENCODE_CONFIG"])
+    conf_dir = os.environ.get("OPENCODE_CONFIG_DIR") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "opencode",
+    )
+    candidatos += [
+        os.path.join(conf_dir, "opencode.jsonc"),
+        os.path.join(conf_dir, "opencode.json"),
+    ]
+    for caminho in candidatos:
+        try:
+            with open(caminho, encoding="utf-8") as fh:
+                bruto = fh.read()
+            try:
+                dados = json.loads(bruto)  # JSON limpo
+            except ValueError:  # JSONC: só remove linhas de comentário e /* */
+                dados = json.loads(
+                    re.sub(r"^\s*//.*$|/\*.*?\*/", "", bruto, flags=re.S | re.M)
+                )
+            modelo = (dados or {}).get("model")
+            if isinstance(modelo, str) and "/" in modelo:
+                return modelo.strip()
+        except Exception:
+            continue
+    return None
+
+
+def _opencode_modelos_disponiveis(bin_path: str) -> list[str]:
+    """IDs `opencode/...` aceites pelo Zen agora (lista vazia se falhar)."""
+    import subprocess as sp
+
+    try:
+        proc = sp.run(
+            [bin_path, "models", "opencode"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            stdin=sp.DEVNULL,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    return [
+        linha.strip()
+        for linha in (proc.stdout or "").splitlines()
+        if linha.strip().startswith("opencode/")
+    ]
+
+
+def _opencode_model(bin_path: str) -> str | None:
+    """Modelo válido para passar a `opencode run --model`.
+
+    O modelo configurado (ex: no opencode.jsonc do workflow) só é usado se
+    ainda existir no catálogo; caso contrário caímos para um modelo free
+    atual. Modelos de outros fornecedores (ex: anthropic/...) são deixados
+    à decisão do CLI (None = sem --model).
+    """
+    if _opencode_model_cache:
+        return next(iter(_opencode_model_cache.values()))
+    configurado = _opencode_config_model()
+    if configurado and not configurado.startswith("opencode/"):
+        return None
+    disponiveis = _opencode_modelos_disponiveis(bin_path)
+    escolhido: str | None = None
+    if configurado and (not disponiveis or configurado in disponiveis):
+        escolhido = configurado
+    else:
+        for modelo in _OPENCODE_MODELOS_FALLBACK:
+            if not disponiveis or modelo in disponiveis:
+                escolhido = modelo
+                break
+        escolhido = escolhido or (disponiveis[0] if disponiveis else None)
+    _opencode_model_cache["v"] = escolhido
+    return escolhido
+
 
 def _opencode_bin() -> str | None:
     """Encontra o binário do OpenCode instalado (None se não existir)."""
@@ -1525,7 +1618,11 @@ def _opencode_run_sync(bin_path: str, prompt: str, cwd: str, timeout: int, conti
     """
     import subprocess as sp
 
-    cmd = [bin_path, "run"] + (["--continue"] if continuar else []) + [prompt]
+    cmd = [bin_path, "run"] + (["--continue"] if continuar else [])
+    modelo = _opencode_model(bin_path)
+    if modelo:
+        cmd += ["--model", modelo]
+    cmd += [prompt]
     proc = sp.run(
         cmd,
         cwd=cwd,
@@ -1537,11 +1634,22 @@ def _opencode_run_sync(bin_path: str, prompt: str, cwd: str, timeout: int, conti
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
+# Escapes de cor (ANSI) que o CLI imprime quando o terminal não é TTY — poluem
+# as mensagens do Telegram (ex: "\x1b[91m\x1b[1mError: ...").
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
 def _fmt_opencode_out(texto: str, limite: int = 3500) -> str:
-    texto = (texto or "").strip() or "(sem saída)"
-    # Remove o banner do CLI ("> build · modelo") e linhas vazias iniciais
+    texto = _ANSI_RE.sub("", texto or "").strip() or "(sem saída)"
+    # Remove o banner do CLI ("> build · modelo") e linhas vazias iniciais.
+    # Atenção: se o texto for SÓ o banner (sem \n), find() devolve -1 e o
+    # texto ficaria igual — tem de esvaziar, senão o ciclo nunca termina.
     while texto and (texto.startswith(">") or texto.startswith("\n")):
-        texto = texto[1:] if texto.startswith("\n") else texto[texto.find("\n") + 1 :]
+        if texto.startswith("\n"):
+            texto = texto[1:]
+        else:
+            fim = texto.find("\n")
+            texto = texto[fim + 1 :] if fim != -1 else ""
         texto = texto.lstrip("\n")
     texto = texto.strip() or "(sem saída)"
     if len(texto) > limite:
@@ -1549,9 +1657,28 @@ def _fmt_opencode_out(texto: str, limite: int = 3500) -> str:
     return texto
 
 
+def _fmt_opencode_err(err: str, out: str) -> str:
+    """Texto de erro para mostrar: stderr, ou stdout se o stderr for só o banner."""
+    detalhe = _fmt_opencode_out(err)
+    if detalhe == "(sem saída)":
+        detalhe = _fmt_opencode_out(out)
+    return detalhe
+
+
+def _erro_opencode_amigavel(texto: str) -> str:
+    """Acrescenta contexto quando o Zen devolve o erro genérico de servidor."""
+    if "UnknownError" in texto or "Unexpected server error" in texto:
+        return (
+            texto
+            + "\n\n🛟 O servidor dos modelos free do Zen falhou (ou o modelo "
+            "configurado já não existe). Tenta novamente dentro de uns minutos."
+        )
+    return texto
+
+
 async def _opencode_ask(pergunta: str, contexto_web: str = "") -> str:
-    """Pergunta à IA do OpenCode local (modelo configurado no opencode.jsonc,
-    atualmente muse-spark free via OpenRouter). Opcionalmente recebe resultados
+    """Pergunta à IA do OpenCode local (modelo free do Zen validado contra o
+    catálogo atual — ver _opencode_model). Opcionalmente recebe resultados
     de pesquisa web para responder com dados atuais."""
     bin_path = _opencode_bin()
     if not bin_path:
@@ -1609,7 +1736,7 @@ async def cmd_opencode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if rc == 0:
         texto = f"✅ *Resultado:*\n{_fmt_opencode_out(out)}"
     else:
-        texto = f"❌ *Erro:*\n{_fmt_opencode_out(err or out)}"
+        texto = f"❌ *Erro:*\n{_erro_opencode_amigavel(_fmt_opencode_err(err, out))}"
     try:
         await thinking.edit_text(texto, parse_mode=ParseMode.HTML)
     except Exception:
@@ -1679,7 +1806,7 @@ async def cmd_opencode_continuar(update: Update, context: ContextTypes.DEFAULT_T
     if rc == 0:
         texto = f"✅ *Resultado ({sessao['prompts']}º da sessão):*\n{_fmt_opencode_out(out)}"
     else:
-        texto = f"❌ *Erro:*\n{_fmt_opencode_out(err or out)}"
+        texto = f"❌ *Erro:*\n{_erro_opencode_amigavel(_fmt_opencode_err(err, out))}"
     try:
         await thinking.edit_text(texto, parse_mode=ParseMode.HTML)
     except Exception:
@@ -4345,6 +4472,15 @@ def main() -> None:
     if not token:
         logger.error("NEOBOT_TOKEN não definido! Exporta a variável de ambiente ou cria um ficheiro .env")
         raise SystemExit(1)
+
+    # Diagnóstico do /opencode: resolve já o modelo válido (evita atraso no
+    # primeiro comando e torna visível nos logs do Actions que modelo corre)
+    bin_oc = _opencode_bin()
+    if bin_oc:
+        try:
+            logger.info("OpenCode: %s · modelo %s", bin_oc, _opencode_model(bin_oc) or "(do CLI)")
+        except Exception:
+            logger.warning("Não consegui resolver o modelo do OpenCode", exc_info=True)
 
     # read_timeout generoso: um "TimedOut" no polling não deve matar o processo
     app = (
