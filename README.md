@@ -4,7 +4,8 @@ Assistente multiuso para Telegram, em Python (`python-telegram-bot`), a falar po
 Pesquisa na web, responde por voz, gera imagens, música e vídeo, serve IPTV, descarrega media — e corre
 24/7 de graça em GitHub Actions.
 
-> 34 comandos + 4 atalhos, resposta a notas de voz e menção `neobot` em grupos.
+> 37 comandos + 5 atalhos (`/help`, `/oc`, `/oci`, `/occ`, `/ocs`), resposta a notas de voz e menção
+> `neobot` em grupos.
 
 ## Comandos
 
