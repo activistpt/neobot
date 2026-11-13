@@ -2,8 +2,9 @@ name: NEOBOT 24/7
 
 # Hospedagem gratuita 24/7 no GitHub Actions:
 # - O bot corre como job de longa duração (timeout máx. de 6h)
-# - A cada 5h25 o agendador dispara um novo job (o cancel-in-progress mata o
-#   anterior) → sessão do Telegram renovada ininterruptamente
+# - Antes do limite, o próprio job pede a execução seguinte (handover) e o
+#   cancel-in-progress mata a anterior → sessão do Telegram renovada sem
+#   depender do agendador do GitHub, que atrasa horas os cron jobs
 # - Repositório público = minutos de Actions ilimitados (grátis para sempre)
 
 on:
@@ -12,7 +13,16 @@ on:
     paths: ["bot.py", "iptv.py", "rebel.m3u", ".github/workflows/neobot.yml"]
   workflow_dispatch:
   schedule:
-    - cron: "25 */5 * * *"   # a cada 5h25 (desfasado para evitar picos :00)
+    # Rede de segurança: se a cadeia de handover se partir (ex.: falha na
+    # instalação de dependências), este cron volta a levantar o bot.
+    # NÃO é o mecanismo principal — o agendador do GitHub atrasa horas.
+    - cron: "25 */6 * * *"
+
+# Necessário para o handover: disparar a execução seguinte com o GITHUB_TOKEN
+# (workflow_dispatch é a exceção documentada). contents: read é para o checkout.
+permissions:
+  contents: read
+  actions: write
 
 concurrency:
   group: neobot
@@ -58,10 +68,24 @@ jobs:
 
       - name: A arrancar o NEOBOT 🤖
         env:
+          GH_TOKEN: ${{ github.token }}
           NEOBOT_TOKEN: ${{ secrets.NEOBOT_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}   # quota ZeroGPU do /music (ACE-Step)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # Lyria (/music) + Veo (/video)
           NEOBOT_HF_TOKENS: ${{ secrets.NEOBOT_HF_TOKENS }}   # tokens HF extra (rotação de quota ZeroGPU)
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}   # /opencode (modelo free do OpenCode)
-        run: python -X utf8 bot.py
+        run: |
+          # Handover: pede já a execução seguinte, 5h20 depois. O job é morto
+          # ao fim de 6h e o cron do GitHub atrasa horas — sem isto há janelas
+          # de 7h a 14h em que o bot simplesmente não está a correr.
+          (
+            sleep 19200
+            gh workflow run neobot.yml --ref main || \
+              curl -fsS -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/neobot.yml/dispatches" \
+                -d '{"ref":"main"}'
+          ) &
+          python -X utf8 bot.py
