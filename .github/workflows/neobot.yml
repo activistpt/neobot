@@ -55,10 +55,10 @@ jobs:
           opencode --version || echo "OPENCODE_INDISPONIVEL"
           mkdir -p ~/.config/opencode
           # Modelo free do Zen. O catálogo muda: se um ID desaparecer, o bot
-          # valida com `opencode models opencode` e cai para outro free.
-          printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "model": "opencode/glm-5.3-flash-free"\n}\n' > ~/.config/opencode/opencode.jsonc
+          # valida com `opencode models` e cai para outro free.
+          printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "model": "opencode/beam-free"\n}\n' > ~/.config/opencode/opencode.jsonc
           cat ~/.config/opencode/opencode.jsonc
-          opencode models opencode || echo "MODELOS_INDISPONIVEIS_NESTE_MOMENTO"
+          opencode models || echo "MODELOS_INDISPONIVEIS_NESTE_MOMENTO"
 
       - name: Teste do motor Seal (diagnostico)
         continue-on-error: true

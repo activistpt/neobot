@@ -1506,17 +1506,23 @@ _OPENCODE_TIMEOUT = 300  # 5 min por tarefa one-shot
 # (a continuidade real fica a cargo do OpenCode: cada continuar corre `run --continue`)
 _opencode_sessoes: dict[int, dict] = {}
 
-# Modelos free do Zen por ordem de preferência. O catálogo destes modelos é
-# volátil — IDs que desaparecem fazem o `opencode run` falhar com
-# "UnknownError ... err_..." no servidor — por isso validamos contra
-# `opencode models opencode` antes de os usar.
+# Modelos free do Zen por ordem de preferência. O catálogo é volátil: quando
+# um ID sai do Zen o `opencode run` responde com o erro genérico
+# "UnknownError ... err_..." (o mesmo que aparece quando a quota free rebenta),
+# por isso validamos contra `opencode models` e, se um modelo falhar, tentamos
+# o seguinte da lista (ver `_opencode_executar`).
 _OPENCODE_MODELOS_FALLBACK = (
-    "opencode/glm-5.3-flash-free",
+    "opencode/beam-free",
     "opencode/deepseek-v4.1-flash-free",
     "opencode/mimo-v2.6-flash-free",
-    "opencode/beam-free",
+    "opencode/hy4-flash-free",
+    "opencode/longcat-2.5-free",
 )
-_opencode_model_cache: dict[str, str | None] = {}
+
+# Catálogo cacheado 10 min: `opencode models` demora ~1-2 s (levanta o serviço
+# de fundo do CLI) e não vale a pena repeti-lo a cada comando.
+_OPENCODE_CATALOGO_TTL = 600
+_opencode_catalogo_cache: dict = {"time": 0.0, "modelos": []}
 
 
 def _opencode_config_model() -> str | None:
@@ -1550,54 +1556,85 @@ def _opencode_config_model() -> str | None:
     return None
 
 
-def _opencode_modelos_disponiveis(bin_path: str) -> list[str]:
-    """IDs `opencode/...` aceites pelo Zen agora (lista vazia se falhar)."""
+def _opencode_catalogo(bin_path: str) -> list[str]:
+    """IDs `opencode/...` (modelos free do Zen) aceites pelo CLI agora.
+
+    `opencode models` NÃO aceita argumentos posicionais — `models opencode`
+    falha com "Unexpected positional argument" e devolvia sempre lista vazia,
+    o que desligava toda a validação de modelos. Filtramos a lista completa.
+
+    Lista vazia = catálogo ilegível (rede/serviço em baixo), não "sem modelos".
+    """
     import subprocess as sp
 
-    try:
-        proc = sp.run(
-            [bin_path, "models", "opencode"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            stdin=sp.DEVNULL,
-        )
-    except Exception:
-        return []
-    if proc.returncode != 0:
-        return []
-    return [
-        linha.strip()
-        for linha in (proc.stdout or "").splitlines()
-        if linha.strip().startswith("opencode/")
-    ]
+    agora = time.time()
+    em_cache = _opencode_catalogo_cache["modelos"]
+    if em_cache and agora - float(_opencode_catalogo_cache["time"]) < _OPENCODE_CATALOGO_TTL:
+        return list(em_cache)
+
+    modelos: list[str] = []
+    # O serviço de fundo pode não arrancar (ex: "Location plugins did not
+    # finish activating"); --standalone sobe um servidor privado e resolve.
+    for extra in ([], ["--standalone"]):
+        try:
+            proc = sp.run(
+                [bin_path, "models", *extra],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                stdin=sp.DEVNULL,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0:
+            continue
+        modelos = [
+            linha.strip()
+            for linha in (proc.stdout or "").splitlines()
+            if linha.strip().startswith("opencode/")
+        ]
+        if modelos:
+            break
+
+    if modelos:
+        _opencode_catalogo_cache["time"] = agora
+        _opencode_catalogo_cache["modelos"] = list(modelos)
+    return modelos
+
+
+def _opencode_candidatos(bin_path: str) -> list[str]:
+    """Modelos a tentar, por ordem: o configurado (se existir no catálogo),
+    os free conhecidos e por fim qualquer free atual do catálogo."""
+    disponiveis = _opencode_catalogo(bin_path)
+    configurado = _opencode_config_model()
+    candidatos: list[str] = []
+    # Configurado fora do catálogo = modelo retirado do Zen: não desperdiçar
+    # uma tentativa com ele.
+    if (
+        configurado
+        and configurado.startswith("opencode/")
+        and (not disponiveis or configurado in disponiveis)
+    ):
+        candidatos.append(configurado)
+    for modelo in _OPENCODE_MODELOS_FALLBACK:
+        if modelo not in candidatos and (not disponiveis or modelo in disponiveis):
+            candidatos.append(modelo)
+    for modelo in disponiveis:  # último recurso: qualquer free que exista agora
+        if modelo not in candidatos:
+            candidatos.append(modelo)
+    return candidatos
 
 
 def _opencode_model(bin_path: str) -> str | None:
-    """Modelo válido para passar a `opencode run --model`.
+    """Primeiro modelo a tentar (None = sem --model, decide o CLI).
 
-    O modelo configurado (ex: no opencode.jsonc do workflow) só é usado se
-    ainda existir no catálogo; caso contrário caímos para um modelo free
-    atual. Modelos de outros fornecedores (ex: anthropic/...) são deixados
-    à decisão do CLI (None = sem --model).
+    Modelos de outros fornecedores (ex: anthropic/...) ficam à decisão do CLI.
     """
-    if _opencode_model_cache:
-        return next(iter(_opencode_model_cache.values()))
     configurado = _opencode_config_model()
     if configurado and not configurado.startswith("opencode/"):
         return None
-    disponiveis = _opencode_modelos_disponiveis(bin_path)
-    escolhido: str | None = None
-    if configurado and (not disponiveis or configurado in disponiveis):
-        escolhido = configurado
-    else:
-        for modelo in _OPENCODE_MODELOS_FALLBACK:
-            if not disponiveis or modelo in disponiveis:
-                escolhido = modelo
-                break
-        escolhido = escolhido or (disponiveis[0] if disponiveis else None)
-    _opencode_model_cache["v"] = escolhido
-    return escolhido
+    candidatos = _opencode_candidatos(bin_path)
+    return candidatos[0] if candidatos else None
 
 
 def _opencode_bin() -> str | None:
@@ -1610,28 +1647,77 @@ def _opencode_bin() -> str | None:
         return None
 
 
-def _opencode_run_sync(bin_path: str, prompt: str, cwd: str, timeout: int, continuar: bool = False) -> tuple[int, str, str]:
+_OPENCODE_TIMEOUT_CODE = 124
+
+
+def _opencode_run_sync(
+    bin_path: str,
+    prompt: str,
+    cwd: str,
+    timeout: int,
+    continuar: bool = False,
+    modelo: str | None = None,
+) -> tuple[int, str, str]:
     """Corre `opencode run <prompt>` (bloqueante — chamar via asyncio.to_thread).
 
     stdin tem de ficar fechado (DEVNULL): sem TTY o CLI fica à espera.
     continuar=True usa `--continue` para seguir a sessão interativa.
+    modelo=None deixa a escolha ao CLI (sem --model).
     """
     import subprocess as sp
 
     cmd = [bin_path, "run"] + (["--continue"] if continuar else [])
-    modelo = _opencode_model(bin_path)
     if modelo:
         cmd += ["--model", modelo]
     cmd += [prompt]
-    proc = sp.run(
-        cmd,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        stdin=sp.DEVNULL,
-    )
+    try:
+        proc = sp.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=sp.DEVNULL,
+        )
+    except sp.TimeoutExpired:
+        return _OPENCODE_TIMEOUT_CODE, "", f"a tarefa excedeu {timeout}s"
     return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+async def _opencode_executar(
+    prompt: str, cwd: str, timeout: int = _OPENCODE_TIMEOUT, continuar: bool = False
+) -> tuple[int, str, str]:
+    """Corre `opencode run` tentando os modelos free até um responder.
+
+    O Zen devolve "UnknownError / Unexpected server error" tanto quando o
+    modelo configurado foi retirado como quando a quota free rebenta; trocar
+    de modelo resolve o primeiro caso, por isso tentamos até 3 candidatos
+    dentro do mesmo orçamento de tempo.
+    """
+    bin_path = _opencode_bin()
+    if not bin_path:
+        raise RuntimeError("OpenCode não instalado neste ambiente")
+    candidatos: list[str | None] = list(_opencode_candidatos(bin_path)) or [None]
+    fim = time.time() + timeout
+    resultado: tuple[int, str, str] = (1, "", "nenhum modelo free disponível")
+    for modelo in candidatos[:3]:
+        restante = int(fim - time.time())
+        if restante < 30:
+            break
+        resultado = await asyncio.to_thread(
+            _opencode_run_sync, bin_path, prompt, cwd, restante, continuar, modelo
+        )
+        if resultado[0] == 0:
+            return resultado
+        texto = (resultado[1] or "") + (resultado[2] or "")
+        # Só vale a pena outro modelo nos erros de modelo/servidor do Zen.
+        if (
+            "Model unavailable" not in texto
+            and "UnknownError" not in texto
+            and "Unexpected server error" not in texto
+        ):
+            break
+    return resultado
 
 
 # Escapes de cor (ANSI) que o CLI imprime quando o terminal não é TTY — poluem
@@ -1666,12 +1752,22 @@ def _fmt_opencode_err(err: str, out: str) -> str:
 
 
 def _erro_opencode_amigavel(texto: str) -> str:
-    """Acrescenta contexto quando o Zen devolve o erro genérico de servidor."""
-    if "UnknownError" in texto or "Unexpected server error" in texto:
+    """Acrescenta contexto aos erros opacos do Zen."""
+    baixo = texto.lower()
+    if "unknown error" in baixo or "unexpected server error" in baixo:
         return (
             texto
-            + "\n\n🛟 O servidor dos modelos free do Zen falhou (ou o modelo "
-            "configurado já não existe). Tenta novamente dentro de uns minutos."
+            + "\n\n🛟 O Zen recusou o pedido. Causas habituais: o modelo free "
+            "foi retirado do catálogo ou a quota gratuita esgotou. Tenta outra "
+            "vez dentro de uns minutos."
+        )
+    if "free usage limit" in baixo or "rate limit" in baixo:
+        return texto + "\n\n⏳ A quota dos modelos free do Zen esgotou por agora."
+    if "model unavailable" in baixo:
+        return (
+            texto
+            + "\n\n🔁 Nenhum dos modelos free conhecidos existe no Zen agora "
+            "(`opencode models`)."
         )
     return texto
 
@@ -1692,10 +1788,7 @@ async def _opencode_ask(pergunta: str, contexto_web: str = "") -> str:
     )
     if contexto_web:
         prompt += "\n\nRESULTADOS DA PESQUISA WEB:\n" + contexto_web
-    rc, out, err = await asyncio.wait_for(
-        asyncio.to_thread(_opencode_run_sync, bin_path, prompt, os.getcwd(), 150, False),
-        timeout=170,
-    )
+    rc, out, err = await _opencode_executar(prompt, os.getcwd(), 150)
     if rc != 0:
         raise RuntimeError((err or out or "erro desconhecido")[:200])
     texto = _fmt_opencode_out(out, limite=3900)
@@ -1727,9 +1820,7 @@ async def cmd_opencode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     thinking = await update.message.reply_text("⚡ A executar via OpenCode...")
     try:
-        rc, out, err = await asyncio.to_thread(
-            _opencode_run_sync, bin_path, prompt, os.getcwd(), _OPENCODE_TIMEOUT
-        )
+        rc, out, err = await _opencode_executar(prompt, os.getcwd(), _OPENCODE_TIMEOUT)
     except Exception as e:
         await thinking.edit_text(f"💥 Erro: {html.escape(str(e))}")
         return
@@ -1787,11 +1878,8 @@ async def cmd_opencode_continuar(update: Update, context: ContextTypes.DEFAULT_T
         return
     thinking = await update.message.reply_text("⚡ A continuar a sessão via OpenCode...")
     try:
-        rc, out, err = await asyncio.wait_for(
-            asyncio.to_thread(
-                _opencode_run_sync, bin_path, prompt, os.getcwd(), _OPENCODE_TIMEOUT, True
-            ),
-            timeout=_OPENCODE_TIMEOUT + 30,
+        rc, out, err = await _opencode_executar(
+            prompt, os.getcwd(), _OPENCODE_TIMEOUT, continuar=True
         )
     except asyncio.TimeoutError:
         await thinking.edit_text(
