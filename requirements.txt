@@ -10,3 +10,13 @@ edge-tts>=7.0
 # /image: HF Inference Providers (Z-Image-Turbo) + reencodagem JPEG
 huggingface_hub>=1.0
 pillow>=10.0
+
+# /image: motores locais opcionais. Descomenta se fores correr Diffusers no bot
+# (no GitHub Actions é pesado: torch + pesos do modelo ficam em GB).
+# diffusers>=0.31
+# torch>=2.4
+
+# /music: MusicGen local (opcional). NÃO descomentar no GitHub Actions: o audiocraft
+# fixa torch==2.1.0, que não tem wheels para o Python 3.12 do workflow.
+# Em Python 3.9-3.11: pip install audiocraft  (arrasta torch/torchaudio 2.1)
+# audiocraft>=1.3

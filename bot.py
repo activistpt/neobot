@@ -693,9 +693,58 @@ async def cmd_wiki(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await thinking.edit_text(answer)
 
 
-# --- /image (HF Inference Providers: Z-Image-Turbo com o HF_TOKEN; fallback Pollinations z-image) ---
+# --- /image (motores locais: WebUI/A1111, Diffusers e stable-diffusion.cpp; nuvem: HF e Pollinations) ---
+#
+# Ordem de tentativa: os motores locais configurados primeiro (é o que se dá ao bot
+# — GPU própria ou CPU, sem quota), depois a nuvem. Cada motor é opcional: só entra
+# na lista se estiver configurado, por isso sem nada montado o comportamento é o
+# antigo (HF → Pollinations).
+#
+#   SD_WEBUI_URL=http://127.0.0.1:7860        WebUI (AUTOMATIC1111) com --api
+#   SD_DIFFUSERS_MODEL=stabilityai/sdxl-turbo diffusers + torch instalados (pip)
+#   SD_CPP_BIN=/opt/sd/sd-cli                 binário do stable-diffusion.cpp
+#   SD_CPP_MODEL=/opt/sd/modelo.safetensors   modelo .safetensors/.gguf/.ckpt
+#   SD_CPP_ARGS="--clip_l ... --t5xxl ..."    argumentos extra (FLUX, Qwen, etc.)
+#
+# Afinação opcional: SD_WEBUI_PASSOS/PASSOS, SD_WEBUI_LARGURA/ALTURA, SD_WEBUI_CFG,
+# SD_WEBUI_SAMPLER, SD_WEBUI_AUTH (utilizador:password), SD_DIFFUSERS_PASSOS/GUIDANCE/
+# LARGURA/ALTURA, SD_CPP_PASSOS/LARGURA/ALTURA, IMAGE_NEGATIVE e IMAGE_TIMEOUT_LOCAL.
 
 _HF_IMAGE_MODEL = "Tongyi-MAI/Z-Image-Turbo"  # rápido, barato em créditos HF
+_IMAGE_NEGATIVO = os.environ.get(
+    "IMAGE_NEGATIVE", "blurry, low quality, watermark, text, extra fingers, deformed"
+)
+
+
+def _image_env(nome: str, omissao, tipo=int):
+    """Lê uma variável de afinação do /image; valor inválido cai na omissão."""
+    bruto = os.environ.get(nome, "").strip()
+    if not bruto:
+        return omissao
+    try:
+        return tipo(bruto)
+    except ValueError:
+        logger.warning("/image: %s=%r inválido — a usar %r", nome, bruto, omissao)
+        return omissao
+
+
+_IMAGE_TIMEOUT_LOCAL = max(30, _image_env("IMAGE_TIMEOUT_LOCAL", 420))
+
+
+def _imagem_para_jpeg(dados: bytes, qualidade: int = 92) -> bytes | None:
+    """Reencoda para JPEG (mais leve no Telegram e igual em todos os motores)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return dados  # pillow em falta: envia como veio
+    try:
+        with Image.open(io.BytesIO(dados)) as img:
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, "JPEG", quality=qualidade)
+        return buf.getvalue()
+    except Exception:
+        logger.warning("/image: não consegui reencodar o resultado — a enviar original")
+        return dados
 
 
 def _hf_token() -> str:
@@ -706,7 +755,7 @@ async def _hf_image(prompt: str) -> bytes | None:
     """Gera uma imagem via HF Inference Providers (rota automática de providers).
 
     Usa o cliente oficial huggingface_hub, que encaminha para fal-ai/replicate/etc.
-    Devolve None (→ fallback Pollinations) se não houver token, créditos ou falha.
+    Devolve None (→ motor seguinte) se não houver token, créditos ou falha.
     """
     token = _hf_token()
     if not token:
@@ -714,7 +763,7 @@ async def _hf_image(prompt: str) -> bytes | None:
     try:
         from huggingface_hub import AsyncInferenceClient
     except ImportError:
-        logger.warning("/image: huggingface_hub não instalado — a usar fallback")
+        logger.warning("/image: huggingface_hub não instalado — a saltar a HF")
         return None
     client = AsyncInferenceClient(token=token, provider="auto")
     try:
@@ -729,6 +778,178 @@ async def _hf_image(prompt: str) -> bytes | None:
     return buf.getvalue()
 
 
+# ── stable-diffusion.cpp (binário local, CPU ou GPU — leejet/stable-diffusion.cpp) ──
+
+
+def _sd_cpp_bin() -> str | None:
+    """Caminho do executável `sd-cli` (ou do antigo `sd`), se existir."""
+    import shutil
+
+    escolhido = os.environ.get("SD_CPP_BIN", "").strip()
+    if escolhido:
+        return escolhido if os.path.isfile(escolhido) else None
+    for nome in ("sd-cli", "sd", "sd-cli.exe", "sd.exe"):
+        caminho = shutil.which(nome)
+        if caminho:
+            return caminho
+    return None
+
+
+def _sd_cpp_modelo() -> str | None:
+    """Modelo a usar: SD_CPP_MODEL, ou o primeiro ficheiro de pesos em ./models ou ~/models."""
+    escolhido = os.environ.get("SD_CPP_MODEL", "").strip()
+    if escolhido:
+        return escolhido if os.path.isfile(escolhido) else None
+    for pasta in ("models", os.path.join(os.path.expanduser("~"), "models")):
+        if not os.path.isdir(pasta):
+            continue
+        for ficheiro in sorted(os.listdir(pasta)):
+            if ficheiro.lower().endswith((".safetensors", ".gguf", ".ckpt", ".pth")):
+                return os.path.join(pasta, ficheiro)
+    return None
+
+
+def _sd_cpp_imagem_sync(prompt: str) -> bytes | None:
+    """Corre o `sd-cli` por subprocesso (bloqueante: chamar num thread)."""
+    import shlex
+    import subprocess
+
+    binario, modelo = _sd_cpp_bin(), _sd_cpp_modelo()
+    if not binario or not modelo:
+        return None
+    largura = _image_env("SD_CPP_LARGURA", 768)
+    altura = _image_env("SD_CPP_ALTURA", 768)
+    passos = _image_env("SD_CPP_PASSOS", 20)
+    with tempfile.TemporaryDirectory(prefix="neobot-sdcpp-") as pasta:
+        saida = os.path.join(pasta, "imagem.png")
+        cmd = [
+            binario,
+            "-m", modelo,
+            "-p", prompt[:800],
+            "-n", _IMAGE_NEGATIVO,
+            "-o", saida,
+            "-W", str(largura),
+            "-H", str(altura),
+            "--steps", str(passos),
+            "-s", str(random.randint(1, 2**31 - 1)),
+            "-t", str(max(1, (os.cpu_count() or 4))),
+        ]
+        extra = os.environ.get("SD_CPP_ARGS", "").strip()
+        if extra:
+            cmd.extend(shlex.split(extra))
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=_IMAGE_TIMEOUT_LOCAL
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("sd.cpp /image: tempo esgotado (%ss)", _IMAGE_TIMEOUT_LOCAL)
+            return None
+        if res.returncode != 0 or not os.path.isfile(saida):
+            logger.warning(
+                "sd.cpp /image falhou (rc=%s): %s",
+                res.returncode,
+                (res.stderr or res.stdout)[-300:].strip(),
+            )
+            return None
+        with open(saida, "rb") as fh:
+            return _imagem_para_jpeg(fh.read())
+
+
+# ── WebUI (AUTOMATIC1111) — API REST /sdapi/v1/txt2img ─────────────────────────────
+
+
+def _sd_webui_url() -> str:
+    return os.environ.get("SD_WEBUI_URL", "").strip().rstrip("/")
+
+
+async def _sd_webui_image(prompt: str) -> bytes | None:
+    """Pede a imagem à API da WebUI (arrancada com --api)."""
+    base = _sd_webui_url()
+    if not base:
+        return None
+    payload = {
+        "prompt": prompt[:800],
+        "negative_prompt": _IMAGE_NEGATIVO,
+        "steps": _image_env("SD_WEBUI_PASSOS", 25),
+        "width": _image_env("SD_WEBUI_LARGURA", 768),
+        "height": _image_env("SD_WEBUI_ALTURA", 768),
+        "cfg_scale": _image_env("SD_WEBUI_CFG", 7.0, float),
+        "sampler_name": os.environ.get("SD_WEBUI_SAMPLER", "DPM++ 2M").strip() or "DPM++ 2M",
+        "send_images": True,
+        "save_images": False,
+    }
+    auth: tuple[str, str] | None = None
+    credenciais = os.environ.get("SD_WEBUI_AUTH", "").strip()  # utilizador:password
+    if ":" in credenciais:
+        utilizador, _, password = credenciais.partition(":")
+        auth = (utilizador, password)
+    try:
+        async with httpx.AsyncClient(timeout=_IMAGE_TIMEOUT_LOCAL) as client:
+            resp = await client.post(f"{base}/sdapi/v1/txt2img", json=payload, auth=auth)
+            resp.raise_for_status()
+            imagens = resp.json().get("images") or []
+    except Exception as exc:
+        logger.warning("WebUI /image falhou: %s: %s", type(exc).__name__, str(exc)[:200])
+        return None
+    if not imagens:
+        logger.warning("WebUI /image: resposta sem imagens")
+        return None
+    import base64
+
+    dados = str(imagens[0])
+    if dados.startswith("data:image"):
+        dados = dados.partition(",")[2]
+    try:
+        return _imagem_para_jpeg(base64.b64decode(dados))
+    except Exception:
+        logger.warning("WebUI /image: imagem em base64 inválida")
+        return None
+
+
+# ── Diffusers (biblioteca Python: o modelo corre no próprio processo) ─────────────
+
+_DIFFUSERS_CACHE: dict = {"modelo": None, "pipe": None}
+
+
+def _diffusers_imagem_sync(prompt: str) -> bytes | None:
+    """Corre um pipeline diffusers (bloqueante: chamar num thread)."""
+    modelo = os.environ.get("SD_DIFFUSERS_MODEL", "").strip()
+    if not modelo:
+        return None
+    try:
+        import torch
+        from diffusers import AutoPipelineForText2Image
+    except ImportError:
+        logger.info("/image: diffusers/torch não instalados — motor saltado")
+        return None
+    if _DIFFUSERS_CACHE["modelo"] != modelo:
+        if torch.cuda.is_available():
+            dispositivo, precisao = "cuda", torch.float16
+        else:
+            dispositivo, precisao = "cpu", torch.float32
+        pipe = AutoPipelineForText2Image.from_pretrained(modelo, torch_dtype=precisao)
+        pipe.to(dispositivo)
+        _DIFFUSERS_CACHE.update(modelo=modelo, pipe=pipe)
+        logger.info("/image: diffusers carregou %s em %s", modelo, dispositivo)
+    pipe = _DIFFUSERS_CACHE["pipe"]
+    # Modelos turbo/schnell/lightning/LCM querem poucos passos e guidance 0.
+    rapido = re.search(r"turbo|schnell|lightning|lcm|z-image", modelo, re.I) is not None
+    imagem = pipe(
+        prompt=prompt[:800],
+        negative_prompt=_IMAGE_NEGATIVO,
+        num_inference_steps=_image_env("SD_DIFFUSERS_PASSOS", 4 if rapido else 28),
+        guidance_scale=_image_env("SD_DIFFUSERS_GUIDANCE", 0.0 if rapido else 7.0, float),
+        width=_image_env("SD_DIFFUSERS_LARGURA", 768),
+        height=_image_env("SD_DIFFUSERS_ALTURA", 768),
+    ).images[0]
+    buf = io.BytesIO()
+    imagem.save(buf, "JPEG", quality=92)
+    return buf.getvalue()
+
+
+# ── Último recurso: Pollinations (sem chave, sem quota) ───────────────────────────
+
+
 def _pollinations_image_url(prompt: str) -> str:
     return (
         "https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt)
@@ -736,29 +957,84 @@ def _pollinations_image_url(prompt: str) -> str:
     )
 
 
+async def _pollinations_image(prompt: str) -> bytes | None:
+    resp = await _http_get(_pollinations_image_url(prompt), timeout=120)
+    resp.raise_for_status()
+    return _imagem_para_jpeg(resp.content)
+
+
+# ── Cadeia de motores ─────────────────────────────────────────────────────────────
+
+
+def _motores_disponiveis() -> list[tuple[str, str]]:
+    """(nome mostrado, chave) dos motores prontos, pela ordem em que serão tentados."""
+    motores: list[tuple[str, str]] = []
+    if _sd_webui_url():
+        motores.append(("WebUI A1111", "webui"))
+    if os.environ.get("SD_DIFFUSERS_MODEL", "").strip():
+        motores.append(("Diffusers", "diffusers"))
+    if _sd_cpp_bin() and _sd_cpp_modelo():
+        motores.append(("stable-diffusion.cpp", "sd_cpp"))
+    if _hf_token():
+        motores.append(("HF · Z-Image-Turbo", "hf"))
+    motores.append(("Pollinations", "pollinations"))
+    return motores
+
+
+async def _gerar_imagem(prompt: str) -> tuple[bytes | None, str]:
+    """Tenta os motores por ordem e devolve (bytes da imagem, motor que respondeu)."""
+    for nome, chave in _motores_disponiveis():
+        try:
+            if chave == "webui":
+                dados = await _sd_webui_image(prompt)
+            elif chave == "diffusers":
+                dados = await asyncio.wait_for(
+                    asyncio.to_thread(_diffusers_imagem_sync, prompt),
+                    timeout=_IMAGE_TIMEOUT_LOCAL,
+                )
+            elif chave == "sd_cpp":
+                dados = await asyncio.wait_for(
+                    asyncio.to_thread(_sd_cpp_imagem_sync, prompt),
+                    timeout=_IMAGE_TIMEOUT_LOCAL,
+                )
+            elif chave == "hf":
+                dados = await _hf_image(prompt)
+            else:
+                dados = await _pollinations_image(prompt)
+        except Exception as exc:
+            logger.warning(
+                "/image: motor %s falhou: %s: %s", nome, type(exc).__name__, str(exc)[:200]
+            )
+            continue
+        if dados:
+            logger.info("/image: gerou com %s", nome)
+            return dados, nome
+    return None, ""
+
+
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     prompt = " ".join(context.args).strip()
     if not prompt:
-        await update.message.reply_text("Como usar:\n`/image gato astronauta a flutuar no espaço`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Como usar:\n`/image gato astronauta a flutuar no espaço`\n\n"
+            "Motores locais (WebUI A1111, Diffusers, stable-diffusion.cpp) quando "
+            "estão configurados; senão HF `Z-Image-Turbo` e Pollinations.",
+            parse_mode="Markdown",
+        )
         return
     if user and _rate_limited(user.id):
         await update.message.reply_text("⏳ Muitas imagens seguidas! Espera um pouco.")
         return
-    thinking = await update.message.reply_text("🎨 A gerar a imagem (IA)...")
-    fonte = "HF · Z-Image-Turbo"
-    image_bytes = await _hf_image(prompt)
+    motores = _motores_disponiveis()
+    thinking = await update.message.reply_text(f"🎨 A gerar a imagem ({motores[0][0]})...")
+    image_bytes, fonte = await _gerar_imagem(prompt)
     if image_bytes is None:
-        await thinking.edit_text("🎨 A HF não respondeu — a tentar a fonte alternativa...")
-        fonte = "Pollinations"
-        try:
-            resp = await _http_get(_pollinations_image_url(prompt), timeout=120)
-            image_bytes = resp.content
-        except Exception:
-            logger.exception("Falha /img (fallback Pollinations)")
-            await thinking.edit_text("❌ A geração de imagens falhou agora. Tenta outra vez em instantes.")
-            return
-    caption = f"🎨 {html.escape(prompt[:200])} — via {fonte}"
+        await thinking.edit_text(
+            "❌ Nenhum motor conseguiu gerar a imagem agora. Tenta outra vez em instantes."
+        )
+        return
+    caption = f"🎨 {html.escape(prompt[:200])} — via {html.escape(fonte)}"
     try:
         await update.message.reply_photo(photo=image_bytes, caption=caption, parse_mode=ParseMode.HTML)
         await thinking.delete()
@@ -3326,6 +3602,49 @@ def _ace_generate(style: str, lyrics: str, duracao: float) -> str:
     raise RuntimeError("Sem quota ZeroGPU disponível hoje (todas as contas HF esgotadas)")
 
 
+async def _music_enviar(
+    update: Update,
+    thinking,
+    caminho: str,
+    motor: str,
+    tema: str,
+    style: str = "",
+    nota: str | None = None,
+) -> bool:
+    """Envia o áudio gerado pelo /music — fonte única de todos os motores.
+
+    Fecha a mensagem de estado e devolve True se o áudio seguiu. Não apaga
+    ficheiros: quem chama trata dos temporários.
+    """
+    try:
+        if not caminho or not os.path.isfile(caminho):
+            await thinking.edit_text("❌ A música foi gerada mas o ficheiro desapareceu.")
+            return False
+        if os.path.getsize(caminho) > TG_FILE_LIMIT:
+            await thinking.edit_text("✅ Música gerada, mas o ficheiro excede 50 MB.")
+            return False
+        linhas = [f"🎼 {html.escape(tema[:60])}"]
+        if style:
+            linhas.append(f"🎚 {html.escape(style[:100])}")
+        linhas += ["", nota or f"🤖 {motor} (open source)"]
+        await update.message.reply_audio(
+            audio=open(caminho, "rb"),
+            title=tema[:60],
+            performer=f"NEOBOT · {motor}",
+            caption="\n".join(linhas),
+            parse_mode=ParseMode.HTML,
+        )
+        await thinking.delete()
+        return True
+    except Exception:
+        logger.exception("Falha ao enviar /music (%s)", motor)
+        try:
+            await thinking.edit_text("❌ A música foi gerada mas o envio falhou. Tenta outra vez.")
+        except Exception:
+            pass
+        return False
+
+
 async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tema = " ".join(context.args).strip()
     if not tema:
@@ -3335,7 +3654,8 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "· `/music uma balada sobre saudade de Lisboa`\n"
             "· `/music rap engraçado sobre exames`\n\n"
             "🤖 A música é gerada pelo ACE-Step (modelo open source que canta a letra "
-            "escrita pela IA), com fallback YuE e MusicGen. Pode demorar 1-3 minutos.",
+            "escrita pela IA), com YuE em alternativa e MusicGen (AudioCraft) como "
+            "instrumental local até 30 s. Pode demorar 1-3 minutos.",
             parse_mode="Markdown",
         )
         return
@@ -3371,17 +3691,10 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             dest_m = os.path.join(tmpdir_m, "neobot_lyria.mp3")
             with open(dest_m, "wb") as fh:
                 fh.write(audio_lyria)
-            if os.path.getsize(dest_m) > TG_FILE_LIMIT:
-                raise RuntimeError("ficheiro excede 50 MB")
-            cap = f"🎼 {html.escape(tema[:60])}\n🤖 Lyria · Google Flow Music"
-            await update.message.reply_audio(
-                audio=open(dest_m, "rb"),
-                title=tema[:60],
-                performer="NEOBOT · Lyria (Google)",
-                caption=cap,
-                parse_mode=ParseMode.HTML,
+            await _music_enviar(
+                update, thinking, dest_m, "Lyria (Google)", tema,
+                nota="🤖 Lyria · Google Flow Music",
             )
-            await thinking.delete()
             try:
                 os.remove(dest_m)
                 os.rmdir(tmpdir_m)
@@ -3469,24 +3782,17 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "(MusicGen, pode demorar até 5 min)..."
             )
             mg = await asyncio.to_thread(
-                _musicgen_fallback, f"{style}. Instrumental, sem voz. Tema: {tema}", tmpdir, 15
+                _musicgen_fallback, f"{style}. Instrumental, sem voz. Tema: {tema}", tmpdir, 30
             )
             if mg:
                 try:
-                    await update.message.reply_audio(
-                        audio=open(mg, "rb"),
-                        title=tema[:60],
-                        performer="NEOBOT · MusicGen",
-                        caption=(
-                            f"🎼 {html.escape(tema[:60])}\n🎚 {html.escape(style[:100])}\n\n"
-                            "🤖 Versão instrumental (fallback CPU). A versão cantada volta quando a GPU gratuita repor."
+                    await _music_enviar(
+                        update, thinking, mg, "MusicGen", tema, style,
+                        nota=(
+                            "🤖 Instrumental gerado localmente pelo MusicGen (AudioCraft), "
+                            "até 30 s. A versão cantada volta quando a GPU gratuita repuser."
                         ),
-                        parse_mode=ParseMode.HTML,
                     )
-                    await thinking.delete()
-                except Exception:
-                    logger.exception("Falha ao enviar fallback /music")
-                    await thinking.edit_text("❌ A música instrumental foi gerada mas o envio falhou.")
                 finally:
                     try:
                         os.remove(mg)
@@ -3498,26 +3804,22 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Tenta outra vez mais tarde (a quota repõe-se em ~24h)."
             )
         else:
-            await thinking.edit_text("❌ A geração de música falhou. Tenta outra vez dentro de alguns minutos.")
+            # O YuE funcionou: envia já — este ramo está dentro do except do ACE-Step,
+            # por isso não chega ao envio final (antes mostrava erro e perdia a música).
+            await _music_enviar(update, thinking, dest, "YuE", tema, style)
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
         return
 
     # 3) enviar (o motor já devolve o ficheiro local)
     try:
-        if os.path.getsize(dest) > TG_FILE_LIMIT:
-            await thinking.edit_text("✅ Música gerada, mas o ficheiro excede 50 MB.")
-            return
-        titulo = html.escape(tema[:60])
-        await update.message.reply_audio(
-            audio=open(dest, "rb"),
-            title=tema[:60],
-            performer=f"NEOBOT · {motor}",
-            caption=f"🎼 {titulo}\n🎚 {html.escape(style[:100])}\n🤖 {motor} (open source)",
-            parse_mode=ParseMode.HTML,
-        )
-        await thinking.delete()
-    except Exception:
-        logger.exception("Falha ao enviar /music")
-        await thinking.edit_text("❌ A música foi gerada mas o envio falhou. Tenta outra vez.")
+        await _music_enviar(update, thinking, dest, motor, tema, style)
     finally:
         if dest:
             try:
@@ -3535,18 +3837,68 @@ async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 VIDEO_NEGATIVE = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
 
-def _musicgen_fallback(prompt: str, out_dir: str, segundos: int = 15) -> str | None:
-    """Fallback do /music: MusicGen (Meta) a correr NA CPU do servidor — sem ZeroGPU,
-    sem quota. Gera música instrumental. Tenta os dois nomes do pacote (audiocraft
-    antigo / supra novo). Devolve o caminho do áudio ou None."""
-    import subprocess as sp
+_MUSICGEN_CACHE: dict = {"modelo": None, "model": None}
+
+
+def _musicgen_audiocraft(prompt: str, out_dir: str, segundos: int = 30) -> str | None:
+    """MusicGen via AudioCraft, no próprio processo (CPU ou GPU local, sem quota).
+
+    Só corre se a biblioteca estiver instalada (`pip install audiocraft torch`);
+    o modelo escolhe-se em MUSICGEN_MODEL. Devolve o caminho do WAV ou None.
+    """
+    modelo_nome = os.environ.get("MUSICGEN_MODEL", "").strip() or "facebook/musicgen-small"
+    try:
+        from audiocraft.models import MusicGen
+    except ImportError:
+        logger.info("/music: audiocraft não instalado — motor MusicGen local saltado")
+        return None
+    try:
+        if _MUSICGEN_CACHE["modelo"] != modelo_nome:
+            _MUSICGEN_CACHE.update(
+                modelo=modelo_nome, model=MusicGen.get_pretrained(modelo_nome)
+            )
+            logger.info("/music: MusicGen carregou %s", modelo_nome)
+        modelo = _MUSICGEN_CACHE["model"]
+        # O MusicGen faz clipes de ~30 s no máximo; abaixo de 5 s não vale a pena.
+        modelo.set_generation_params(duration=max(5, min(int(segundos), 30)))
+        wav = modelo.generate([prompt[:400]])
+    except Exception as exc:
+        logger.warning("MusicGen falhou: %s: %s", type(exc).__name__, str(exc)[:200])
+        return None
+    destino = os.path.join(out_dir, "neobot_musicgen.wav")
+    try:
+        import torchaudio
+
+        torchaudio.save(destino, wav[0].cpu(), modelo.sample_rate)
+    except Exception:
+        try:  # alternativa oficial do AudioCraft (precisa de ffmpeg)
+            from audiocraft.data.audio import audio_write
+
+            audio_write(destino[:-4], wav[0].cpu(), modelo.sample_rate, strategy="loudness")
+        except Exception:
+            logger.exception("MusicGen: não consegui gravar o áudio")
+            return None
+    return destino if os.path.isfile(destino) else None
+
+
+def _musicgen_fallback(prompt: str, out_dir: str, segundos: int = 30) -> str | None:
+    """Fallback do /music: MusicGen (Meta/AudioCraft) — primeiro a biblioteca no
+    processo, e só se não estiver instalada o CLI do pacote. Sem ZeroGPU, sem quota.
+    Gera música instrumental. Devolve o caminho do áudio ou None."""
+    destino = _musicgen_audiocraft(prompt, out_dir, segundos)
+    if destino:
+        return destino
+
     import shutil as _sh
+    import subprocess as sp
+
     py = _sh.which("python") or "python"
+    duracao = str(max(5, min(int(segundos), 30)))
     candidatos = [
         [py, "-m", "audiocraft.generate", "--model", "facebook/musicgen-small",
-         "--texts", prompt, "--duration", str(segundos), "--output-dir", out_dir],
+         "--texts", prompt, "--duration", duracao, "--output-dir", out_dir],
         [py, "-m", "supra.engine.cli", "/generate", "--texts", prompt,
-         "--duration", str(segundos), "--output-dir", out_dir],
+         "--duration", duracao, "--output-dir", out_dir],
     ]
     env = {**os.environ, "PYTORCH_JIT": "0"}
     for cmd in candidatos:

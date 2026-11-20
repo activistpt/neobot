@@ -20,8 +20,8 @@ Pesquisa na web, responde por voz, gera imagens, música e vídeo, serve IPTV, d
 | `/audio <pergunta>` | Igual ao `/ask`, mas responde em voz pt-PT |
 | `/voz <texto>` | Converte texto em voz de Portugal (`/voz boa noite`, `/voz raquel olá!`) |
 | *(nota de voz)* | Envia um clip de voz sem comando: transcreve (Whisper) e responde em áudio |
-| `/image <prompt>` | Gera imagem — HF `Z-Image-Turbo`, com fallback automático para Pollinations |
-| `/music <tema>` | Música original: Lyria (Gemini) primeiro, ACE-Step (HF Space) como alternativa |
+| `/image <prompt>` | Gera imagem — motores locais (WebUI A1111, Diffusers, stable-diffusion.cpp) quando estão configurados; HF `Z-Image-Turbo` e Pollinations em fallback |
+| `/music <tema>` | Música original: Lyria (Gemini) → ACE-Step → YuE (HF Spaces, cantada) e MusicGen (AudioCraft) instrumental até 30 s |
 | `/video <prompt>` | Vídeo texto→vídeo (Wan2.2 via HF Inference Providers → CogVideoX-5B → LTX-Video destilado; Veo como alternativa). A responder a uma imagem, anima-a (Wan2.2 I2V Lightning) |
 | `/opencode <tarefa>` (`/oc`) | Corre uma tarefa de código no OpenCode CLI local, com modelo free do Zen |
 | `/opencode_iniciar` (`/oci`) | Abre uma sessão OpenCode contínua (uma por utilizador) |
@@ -132,6 +132,11 @@ base de dados nem ficheiros persistentes.
 | `NEOBOT_HF_TOKENS` | opcional | Tokens HF extra, para rodar a quota quando a principal esgota |
 | `GEMINI_API_KEY` | opcional | Lyria (`/music`) e Veo (`/video`) |
 | `OPENROUTER_API_KEY` | opcional | Passada pelo workflow para o `/opencode` |
+| `SD_WEBUI_URL` | opcional | `/image`: WebUI (AUTOMATIC1111) arrancada com `--api` (ex.: `http://127.0.0.1:7860`) |
+| `SD_DIFFUSERS_MODEL` | opcional | `/image`: modelo do diffusers (ex.: `stabilityai/sdxl-turbo`); exige `diffusers` e `torch` |
+| `SD_CPP_BIN` / `SD_CPP_MODEL` | opcional | `/image`: executável `sd-cli` e pesos do stable-diffusion.cpp |
+| `IMAGE_NEGATIVE`, `SD_*_PASSOS` … | opcional | Afinação dos motores de imagem (prompt negativo, passos, largura/altura) |
+| `MUSICGEN_MODEL` | opcional | `/music`: modelo do AudioCraft (predefinição `facebook/musicgen-small`); exige `audiocraft` em Python 3.9-3.11 |
 | `PORT` | opcional | Porta do servidor de saúde/webhook (predefinição `7860`) |
 | `RENDER_EXTERNAL_URL` / `KOYEB_PUBLIC_DOMAIN` | opcional | Ativam o modo webhook com essa URL pública |
 | `GROQ_MODEL` | opcional | Modelo Groq (predefinição `openai/gpt-oss-120b`) |
@@ -156,6 +161,57 @@ py bot.py
 
 Sem `RENDER_EXTERNAL_URL`/`KOYEB_PUBLIC_DOMAIN` arranca em polling. Para parar: `Ctrl+C`
 (o lock é libertado no `atexit`).
+
+### Motores de imagem (`/image`)
+
+O `/image` percorre os motores por ordem e fica com o primeiro que responder:
+
+1. **WebUI (AUTOMATIC1111)** — define `SD_WEBUI_URL`. Arranca a WebUI com `--api` e o bot
+   chama `POST /sdapi/v1/txt2img`. Com autenticação, usa `SD_WEBUI_AUTH=utilizador:password`.
+2. **Diffusers** — define `SD_DIFFUSERS_MODEL` (ex.: `stabilityai/sdxl-turbo`,
+   `black-forest-labs/FLUX.1-schnell`) e instala `diffusers` + `torch`. O pipeline fica em
+   memória depois do primeiro pedido; modelos *turbo/schnell/lightning* usam 4 passos e
+   guidance 0 automaticamente.
+3. **stable-diffusion.cpp** — define `SD_CPP_BIN` (o `sd-cli` dos
+   [releases](https://github.com/leejet/stable-diffusion.cpp/releases)) e `SD_CPP_MODEL`
+   (`.safetensors`, `.gguf` ou `.ckpt`). Corre por subprocesso, em CPU ou GPU; modelos com
+   vários ficheiros (FLUX, Qwen) passam os encoders extra em `SD_CPP_ARGS`.
+4. **Nuvem** — HF Inference (`Z-Image-Turbo`, precisa de `HF_TOKEN`) e, em último recurso,
+   Pollinations (sem chave nenhuma).
+
+Os três primeiros são locais: só entram na lista se o software e as variáveis existirem, por
+isso sem nada montado o comportamento continua a ser o antigo. No GitHub Actions não há GPU
+nem estes binários — aí o `/image` continua a sair pela HF e pelo Pollinations.
+
+Exemplo (Linux) com SD 1.5 no stable-diffusion.cpp:
+
+```bash
+curl -L -O https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors
+export SD_CPP_MODEL="$PWD/v1-5-pruned-emaonly.safetensors"
+export SD_CPP_BIN="/opt/stable-diffusion.cpp/bin/sd-cli"
+```
+
+### Música (`/music`)
+
+A cadeia é **Lyria** (Gemini, cantada) → **ACE-Step** (HF Space, cantada) → **YuE** (HF Space,
+cantada) → **MusicGen** (AudioCraft, instrumental). Os três primeiros dependem de chave e
+quota; o MusicGen corre local:
+
+```bash
+# Python 3.9-3.11: o audiocraft fixa torch==2.1.0, que não tem wheels para 3.12
+pip install audiocraft
+export MUSICGEN_MODEL=facebook/musicgen-small   # ou musicgen-medium / musicgen-large
+```
+
+O modelo fica em memória depois do primeiro pedido e cada clipe vai de 5 a 30 s (o máximo do
+MusicGen). O bot pede sempre instrumental, porque o MusicGen não canta letras.
+
+**Verificado** com `facebook/musicgen-small` em CPU: clipe de 5 s, 32 kHz, mono, com áudio
+real. Nessa máquina (Python 3.12) o pacote não instala pelo caminho normal — foi preciso
+`pip install --no-deps audiocraft` com torch 2.5, mais `hydra-core`, `spacy`, `encodec`,
+`transformers<5` e um shim para o `xformers`, que o audiocraft importa sem alternativa.
+Por isso, **no GitHub Actions (Python 3.12) o MusicGen local não entra**: o `/music` fica-se
+pelo Lyria/ACE-Step/YuE e o passo de diagnóstico imprime `AUDIOCRAFT_AUSENTE`.
 
 ## Estrutura
 

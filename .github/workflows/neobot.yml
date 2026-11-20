@@ -66,6 +66,17 @@ jobs:
           yt-dlp --version
           yt-dlp --no-playlist -f "bestaudio/best" --simulate --print "%(title)s" "https://www.youtube.com/watch?v=jNQXAC9IVRw" || echo "TESTE_YOUTUBE_FALHOU"
 
+      - name: Motores locais (diagnostico)
+        continue-on-error: true
+        env:
+          SD_WEBUI_URL: ${{ vars.SD_WEBUI_URL }}
+        run: |
+          command -v sd-cli || command -v sd || echo "SD_CPP_AUSENTE"
+          python -c "import diffusers, torch; print('DIFFUSERS_OK')" || echo "DIFFUSERS_AUSENTE"
+          python -c "import audiocraft; print('AUDIOCRAFT_OK')" || echo "AUDIOCRAFT_AUSENTE"
+          curl -fsS -m 5 "${SD_WEBUI_URL:-http://127.0.0.1:7860}/sdapi/v1/sd-models" >/dev/null \
+            && echo "WEBUI_OK" || echo "WEBUI_AUSENTE"
+
       - name: A arrancar o NEOBOT 🤖
         env:
           GH_TOKEN: ${{ github.token }}
@@ -75,6 +86,12 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # Lyria (/music) + Veo (/video)
           NEOBOT_HF_TOKENS: ${{ secrets.NEOBOT_HF_TOKENS }}   # tokens HF extra (rotação de quota ZeroGPU)
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}   # /opencode (modelo free do OpenCode)
+          # Motores locais do /image (opcional): variáveis do repositório, não segredos
+          SD_WEBUI_URL: ${{ vars.SD_WEBUI_URL }}   # WebUI (AUTOMATIC1111) com --api
+          SD_DIFFUSERS_MODEL: ${{ vars.SD_DIFFUSERS_MODEL }}   # diffusers (precisa de torch)
+          SD_CPP_BIN: ${{ vars.SD_CPP_BIN }}   # binário sd-cli
+          SD_CPP_MODEL: ${{ vars.SD_CPP_MODEL }}   # pesos .safetensors/.gguf
+          MUSICGEN_MODEL: ${{ vars.MUSICGEN_MODEL }}   # /music: MusicGen local (audiocraft)
         run: |
           # Handover: pede já a execução seguinte, 5h20 depois. O job é morto
           # ao fim de 6h e o cron do GitHub atrasa horas — sem isto há janelas
